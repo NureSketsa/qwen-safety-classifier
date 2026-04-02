@@ -1,0 +1,95 @@
+# ============================================================
+# Qwen Safety Classifier — Central Configuration
+# ============================================================
+
+# ── Model ────────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen3.5-0.8B-Instruct"
+  max_seq_length: 2048
+  max_new_tokens: 512
+  thinking_mode: false          # non-thinking: direct output, no <think> block
+
+# ── QLoRA ────────────────────────────────────────────────────
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+    - up_proj
+    - down_proj
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# ── Training ─────────────────────────────────────────────────
+training:
+  output_dir_trl:      "output/trl_checkpoint"
+  output_dir_unsloth:  "output/unsloth_checkpoint"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 2       # effective batch = 8
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "linear"
+  warmup_steps: 100
+  weight_decay: 0.01
+  optim: "adamw_torch"
+  bf16: true                            # use bf16 if supported; else set fp16: true
+  fp16: false
+  save_strategy: "steps"
+  save_steps: 200
+  eval_strategy: "steps"
+  eval_steps: 200
+  logging_steps: 10
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_f1"
+  greater_is_better: true
+  report_to: "none"                     # set "wandb" or "tensorboard" if needed
+  dataloader_num_workers: 2
+
+# ── Dataset ──────────────────────────────────────────────────
+dataset:
+  # Local paths (after prepare step)
+  train_json:   "dataset/train_data.json"
+  val_json:     "dataset/val_data.json"
+  sample_dir:   "dataset/sample"
+
+  # Raw source paths
+  metadata_csv: "dataset/metadata.csv"
+  image_root:   "dataset/Kontent"       # contains class_0 .. class_4
+  val_split:    0.2
+  seed: 42
+
+  # Class folder mapping  (X in X_Y.jpg  →  folder name)
+  class_folders:
+    0: "class_0"
+    1: "class_1"
+    2: "class_2"
+    3: "class_3"
+    4: "class_4"
+
+# ── Prompt ───────────────────────────────────────────────────
+prompt:
+  system: |
+    Kamu adalah sistem klasifikasi konten yang membantu pemerintah Indonesia
+    menegakkan UU ITE Pasal 28 Ayat 2. Analisis gambar yang diberikan secara
+    cermat dan berikan:
+    1. Reasoning detail dalam Bahasa Indonesia menjelaskan apa yang terlihat
+       dan mengapa konten tersebut melanggar atau tidak melanggar regulasi.
+    2. Label akhir: SAFE atau UNSAFE.
+
+    Format output (wajib diikuti):
+    REASONING: <penjelasan detail>
+    LABEL: <SAFE|UNSAFE>
+
+# ── Merge / Export ───────────────────────────────────────────
+merge:
+  trl_merged:     "output/trl_merged"
+  unsloth_merged: "output/unsloth_merged"
+
+# ── Evaluation ───────────────────────────────────────────────
+eval:
+  results_dir: "output/eval_results"
+  bertscore_lang: "id"                  # Indonesian
+  manual_eval_n: 50

@@ -1,0 +1,45 @@
+# ============================================================
+# Qwen Safety Classifier — Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# For Unsloth: see train_unsloth.py header (env-specific install)
+# ============================================================
+
+# Core ML
+torch>=2.1.0
+transformers>=4.47.0
+peft>=0.13.0
+trl>=0.12.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0          # 4-bit quantization (QLoRA)
+
+# Vision
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0  # video frame extraction (headless = no GUI dep)
+torchvision>=0.16.0
+
+# Data
+pandas>=2.0.0
+scikit-learn>=1.4.0
+datasets>=2.18.0
+huggingface_hub>=0.22.0
+
+# Evaluation
+evaluate>=0.4.0
+bert-score>=0.3.13
+
+# Config & Utils
+pyyaml>=6.0
+tqdm>=4.66.0
+numpy>=1.26.0
+
+# Optional: experiment tracking (uncomment if needed)
+# wandb>=0.17.0
+# tensorboard>=2.17.0
+
+# ── Unsloth (install separately — version locked) ─────────────
+# Kaggle / Colab (CUDA 12.1):
+#   pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+# Local with CUDA 12.1:
+#   pip install "unsloth[cu121-torch240] @ git+https://github.com/unslothai/unsloth.git"
+# Check https://unsloth.ai/docs/get-started/installation for your exact env
