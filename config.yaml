@@ -4,7 +4,7 @@
 
 # ── Model ────────────────────────────────────────────────────
 model:
-  name: "Qwen/Qwen3.5-0.8B-Instruct" 
+  name: "unsloth/Qwen3.5-0.8B"
   max_seq_length: 512        
   max_new_tokens: 256
   # thinking_mode: false          # non-thinking: direct output, no <think> block

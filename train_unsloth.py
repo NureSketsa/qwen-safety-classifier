@@ -1,46 +1,25 @@
-"""
-train_unsloth.py
-================
-Fine-tune Qwen3.5-0.8B with QLoRA using Unsloth FastVisionModel.
-~3GB VRAM, 1.5-2x faster than TRL, same results.
-
-Install:
-  pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-
-Usage:
-  python train_unsloth.py
-  python train_unsloth.py --config config.yaml --resume
-"""
-
-import unsloth
+import unsloth  # MUST be first
+from unsloth import FastLanguageModel
 import argparse
 import json
 import os
+os.environ["UNSLOTH_DISABLE_THINKING"] = "1" 
 from pathlib import Path
 
 import torch
 import yaml
 from datasets import Dataset
 from PIL import Image
-from transformers import TrainingArguments,Trainer
 
-try:
-    from unsloth import FastVisionModel
-    from trl import SFTTrainer
-except ImportError:
-    print("[ERROR] Unsloth not installed. Run:")
-    print('  pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"')
-    import sys; sys.exit(1)
+from unsloth import FastVisionModel
+from unsloth.trainer import UnslothVisionDataCollator
+from trl import SFTTrainer, SFTConfig
 
-
-# ── Config ───────────────────────────────────────────────────────────────────
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
-
-# ── Dataset ──────────────────────────────────────────────────────────────────
 
 def load_json_dataset(json_path: str) -> list[dict]:
     with open(json_path, encoding="utf-8") as f:
@@ -50,80 +29,49 @@ def load_json_dataset(json_path: str) -> list[dict]:
 def make_hf_dataset(records):
     return Dataset.from_list([
         {
-            "messages_json": json.dumps(r["messages"], ensure_ascii=False),
+            "messages":   r["messages"],       # keep as list, NOT json string
             "image_path": r["image_path"],
-            "label": r.get("label", ""),
+            "label":      r.get("label", ""),
         }
         for r in records
     ])
 
 
-# ── Collator ─────────────────────────────────────────────────────────────────
+def convert_to_conversation(sample, processor):
+    """
+    Convert a dataset sample to the format UnslothVisionDataCollator expects:
+    a dict with 'messages' (applied chat template) and 'images' (list of PIL).
+    """
+    try:
+        image = Image.open(sample["image_path"]).convert("RGB")
+    except Exception as e:
+        print(f"[WARN] Cannot load {sample['image_path']}: {e}")
+        image = Image.new("RGB", (224, 224), color=(128, 128, 128))
 
-class VLMDataCollator:
-    def __init__(self, processor, max_seq_length: int = 1024):
-        self.processor = processor
-        self.max_seq_length = max_seq_length
+    return {"messages": sample["messages"], "images": [image]}
 
-    def __call__(self, batch: list[dict]) -> dict:
-        texts, images = [], []
-
-        for sample in batch:
-            try:
-                image = Image.open(sample["image_path"]).convert("RGB")
-            except Exception as e:
-                print(f"[WARN] Cannot load image {sample['image_path']}: {e}")
-                image = Image.new("RGB", (224, 224), color=(128, 128, 128))
-            images.append(image)
-
-            messages = json.loads(sample["messages_json"])
-            text = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            texts.append(text)
-
-        encoding = self.processor(
-            text=texts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-
-        labels = encoding["input_ids"].clone()
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        encoding["labels"] = labels
-        return encoding
-
-
-# ── Model ─────────────────────────────────────────────────────────────────────
 
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
     lora_cfg = cfg["lora"]
 
-    # Don't remap to unsloth/ prefix — model may not exist there yet
     print(f"Loading model with Unsloth: {model_name}")
 
-    model, processor = FastVisionModel.from_pretrained(
-        model_name=model_name,   # uses "Qwen/Qwen3.5-0.8B-Instruct" directly
+    model, processor = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=cfg["model"]["max_seq_length"],
         load_in_4bit=True,
-        use_gradient_checkpointing="unsloth",
+        dtype=None,  # auto-detect, avoids the float32 warning
     )
 
-    model = FastVisionModel.get_peft_model(
+    model = FastLanguageModel.get_peft_model(
         model,
-        finetune_vision_layers=True,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
         r=lora_cfg["r"],
         lora_alpha=lora_cfg["alpha"],
         lora_dropout=lora_cfg["dropout"],
+        target_modules=lora_cfg["target_modules"],
         bias=lora_cfg["bias"],
+        use_gradient_checkpointing="unsloth",
         random_state=42,
     )
 
@@ -133,37 +81,7 @@ def load_model_and_processor(cfg: dict):
     return model, processor
 
 
-class UnslothVLMTrainer(Trainer):
-    """
-    Subclass that unpacks our collator's dict and explicitly calls
-    model(**inputs) to get the loss — bypassing Unsloth's patched
-    _unsloth_training_step which expects SFTTrainer's data layout.
-    """
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.get("labels")
-        outputs = model(**inputs)
-
-        # outputs is a CausalLMOutputWithPast; .loss is the CE loss tensor
-        loss = outputs.loss
-
-        if loss is None:
-            # Fallback: compute manually (shouldn't happen with labels set)
-            logits = outputs.logits
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        return (loss, outputs) if return_outputs else loss
-    
-# ── Training ─────────────────────────────────────────────────────────────────
-
 def main():
-    # Single GPU — same reason as TRL version
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     parser = argparse.ArgumentParser()
@@ -187,17 +105,29 @@ def main():
     # ── Load model
     model, processor = load_model_and_processor(cfg)
 
-    # Switch to training mode (Unsloth-specific — must be called before Trainer)
+    # ── Switch to training mode (Unsloth-specific, must be before SFTTrainer)
     FastVisionModel.for_training(model)
 
-    # ── Collator
-    collator = VLMDataCollator(processor, max_seq_length=cfg["model"]["max_seq_length"])
+    # ── Convert datasets to {messages, images} format
+    train_dataset = [convert_to_conversation(s, processor) for s in train_dataset]
+    val_dataset   = [convert_to_conversation(s, processor) for s in val_dataset]
 
-    # ── TrainingArguments — mirrors TRL version exactly
+    # ── Data collator — this is the key difference from your old version
+    data_collator = UnslothVisionDataCollator(
+        model,
+        processor,
+        train_on_responses_only=True,
+        instruction_part="<|im_start|>user\n",
+        response_part="<|im_start|>assistant\n",
+    )
+
+    # ── SFTConfig
     output_dir = train_cfg["output_dir_unsloth"]
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    training_args = TrainingArguments(
+    use_bf16 = torch.cuda.is_bf16_supported()
+
+    sft_config = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=train_cfg["num_train_epochs"],
         per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
@@ -207,9 +137,9 @@ def main():
         lr_scheduler_type=train_cfg["lr_scheduler_type"],
         warmup_steps=train_cfg["warmup_steps"],
         weight_decay=train_cfg["weight_decay"],
-        optim=train_cfg["optim"],
-        bf16=train_cfg["bf16"],
-        fp16=train_cfg["fp16"],
+        optim="adamw_8bit",       # ← Unsloth's optimized optimizer
+        bf16=use_bf16,
+        fp16=not use_bf16,
         save_strategy=train_cfg["save_strategy"],
         save_steps=train_cfg["save_steps"],
         eval_strategy=train_cfg["eval_strategy"],
@@ -217,36 +147,37 @@ def main():
         logging_steps=train_cfg["logging_steps"],
         load_best_model_at_end=False,
         report_to=train_cfg["report_to"],
-        dataloader_num_workers=train_cfg["dataloader_num_workers"],
+        dataloader_num_workers=0,  # ← 0 prevents multiprocessing PIL issues
         remove_unused_columns=False,
-        dataloader_pin_memory=False,
-        local_rank=-1,
-        ddp_find_unused_parameters=False,
+        # ── Critical: skip TRL's internal dataset processing
+        dataset_text_field="",
+        dataset_kwargs={"skip_prepare_dataset": True},
+        max_seq_length=cfg["model"]["max_seq_length"],
+        seed=ds_cfg["seed"],
     )
 
-    # ── Trainer — use base Trainer like TRL version (not SFTTrainer)
-    # SFTTrainer tries to reprocess text which breaks our custom collator
-    from transformers import Trainer
-    trainer = UnslothVLMTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    data_collator=collator,
-    )
+    # ── SFTTrainer
+    import inspect
+    trainer_params = inspect.signature(SFTTrainer).parameters
+    trainer_kwargs = {
+        "model":          model,
+        "args":           sft_config,
+        "train_dataset":  train_dataset,
+        "eval_dataset":   val_dataset,
+        "data_collator":  data_collator,
+    }
+    # TRL 0.12+ renamed tokenizer → processing_class
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = processor
+    else:
+        trainer_kwargs["tokenizer"] = processor
+
+    trainer = SFTTrainer(**trainer_kwargs)
 
     # ── Train
     print("\nStarting Unsloth training ...")
     resume_ckpt = output_dir if args.resume else None
-    print(f"GPU memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-    print(f"GPU memory reserved:  {torch.cuda.memory_reserved()/1e9:.2f} GB")
-    
-    try:
-        trainer.train(resume_from_checkpoint=resume_ckpt)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print("\n💥 OOM! Free memory:", torch.cuda.memory_summary())
-        raise
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # ── Save adapter
     final_path = Path(output_dir) / "final_adapter"
@@ -254,7 +185,7 @@ def main():
     processor.save_pretrained(final_path)
     print(f"\n✓ Adapter saved: {final_path}")
 
-    # ── Optional: merge to fp16 for deployment
+    # ── Merge to fp16
     merge_path = Path(cfg["merge"]["unsloth_merged"])
     merge_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained_merged(str(merge_path), processor, save_method="merged_16bit")
