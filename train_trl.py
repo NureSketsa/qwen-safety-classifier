@@ -24,11 +24,10 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
-    Qwen2_5_VLForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,   # ← was Qwen2_5_VLForConditionalGeneration
     TrainingArguments,
-    Trainer,                    # ← add this
+    Trainer,
 )
-
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -126,7 +125,6 @@ class VLMDataCollator:
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
 
-    # 4-bit quantization config
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -135,7 +133,7 @@ def load_model_and_processor(cfg: dict):
     )
 
     print(f"Loading model: {model_name}")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(  # ← changed
         model_name,
         quantization_config=bnb_config,
         device_map="auto",
@@ -147,7 +145,6 @@ def load_model_and_processor(cfg: dict):
         trust_remote_code=True,
     )
 
-    # Ensure pad token is set
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
