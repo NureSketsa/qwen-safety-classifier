@@ -46,8 +46,20 @@ def load_json_dataset(json_path: str) -> list[dict]:
         return json.load(f)
 
 
-def make_hf_dataset(records: list[dict]) -> Dataset:
-    """Wrap list of dicts into a HuggingFace Dataset."""
+def make_hf_dataset(records):
+    from datasets import Dataset
+
+    # --- TAMBAHKAN KODE NORMALISASI INI ---
+    for record in records:
+        if "images" in record:
+            # Jika images berupa string, paksa menjadi list
+            if isinstance(record["images"], str):
+                record["images"] = [record["images"]]
+            # Jika images kosong (None), jadikan list kosong
+            elif record["images"] is None:
+                record["images"] = []
+    # --------------------------------------
+
     return Dataset.from_list(records)
 
 
