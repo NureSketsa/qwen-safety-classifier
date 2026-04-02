@@ -226,7 +226,6 @@ def main():
     report_to=train_cfg["report_to"],
     dataloader_num_workers=train_cfg["dataloader_num_workers"],
     remove_unused_columns=False,
-    no_cuda=False,
     dataloader_pin_memory=False,  
     )
 
