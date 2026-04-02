@@ -63,17 +63,23 @@ def make_hf_dataset(records):
 
 
 def convert_to_conversation(sample, processor):
-    """
-    Convert a dataset sample to the format UnslothVisionDataCollator expects:
-    a dict with 'messages' (applied chat template) and 'images' (list of PIL).
-    """
     try:
         image = Image.open(sample["image_path"]).convert("RGB")
     except Exception as e:
         print(f"[WARN] Cannot load {sample['image_path']}: {e}")
         image = Image.new("RGB", (224, 224), color=(128, 128, 128))
 
-    return {"messages": sample["messages"], "images": [image]}
+    messages = sample["messages"]
+
+    # 🔥 CRITICAL: inject image token
+    if len(messages) > 0:
+        if "<image>" not in messages[0]["content"]:
+            messages[0]["content"] = "<image>\n" + messages[0]["content"]
+
+    return {
+        "messages": messages,
+        "images": [image],
+    }
 
 
 def load_model_and_processor(cfg: dict):
@@ -180,6 +186,8 @@ def main():
         max_seq_length=cfg["model"]["max_seq_length"],
         seed=ds_cfg["seed"],
     )
+    
+    print(train_dataset[0])
 
     # ── SFTTrainer
     import inspect
