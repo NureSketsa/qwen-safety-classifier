@@ -26,8 +26,8 @@ from transformers import (
     BitsAndBytesConfig,
     Qwen2_5_VLForConditionalGeneration,
     TrainingArguments,
+    Trainer,                    # ← add this
 )
-from trl import SFTTrainer
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -208,33 +208,31 @@ def main():
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=train_cfg["num_train_epochs"],
-        per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
-        per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
-        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
-        learning_rate=train_cfg["learning_rate"],
-        lr_scheduler_type=train_cfg["lr_scheduler_type"],
-        warmup_steps=train_cfg["warmup_steps"],
-        weight_decay=train_cfg["weight_decay"],
-        optim=train_cfg["optim"],
-        bf16=train_cfg["bf16"],
-        fp16=train_cfg["fp16"],
-        save_strategy=train_cfg["save_strategy"],
-        save_steps=train_cfg["save_steps"],
-        eval_strategy=train_cfg["eval_strategy"],
-        eval_steps=train_cfg["eval_steps"],
-        logging_steps=train_cfg["logging_steps"],
-        load_best_model_at_end=train_cfg["load_best_model_at_end"],
-        metric_for_best_model=train_cfg["metric_for_best_model"],
-        greater_is_better=train_cfg["greater_is_better"],
-        report_to=train_cfg["report_to"],
-        dataloader_num_workers=train_cfg["dataloader_num_workers"],
-        remove_unused_columns=False,  # keep image_path column for collator
+    output_dir=output_dir,
+    num_train_epochs=train_cfg["num_train_epochs"],
+    per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
+    per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
+    gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
+    learning_rate=train_cfg["learning_rate"],
+    lr_scheduler_type=train_cfg["lr_scheduler_type"],
+    warmup_steps=train_cfg["warmup_steps"],
+    weight_decay=train_cfg["weight_decay"],
+    optim=train_cfg["optim"],
+    bf16=train_cfg["bf16"],
+    fp16=train_cfg["fp16"],
+    save_strategy=train_cfg["save_strategy"],
+    save_steps=train_cfg["save_steps"],
+    eval_strategy=train_cfg["eval_strategy"],
+    eval_steps=train_cfg["eval_steps"],
+    logging_steps=train_cfg["logging_steps"],
+    load_best_model_at_end=False,   # ← disable, needs eval metric
+    report_to=train_cfg["report_to"],
+    dataloader_num_workers=train_cfg["dataloader_num_workers"],
+    remove_unused_columns=False,
     )
 
     # ── Trainer
-    trainer = SFTTrainer(
+    trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
