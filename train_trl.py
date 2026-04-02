@@ -121,23 +121,23 @@ class VLMDataCollator:
 
 # ── Model Setup ──────────────────────────────────────────────────────────────
 
-
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
+        llm_int8_skip_modules=["visual", "lm_head"],  # ← exclude vision encoder
     )
-
     print(f"Loading model: {model_name}")
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
-    model_name,
-    quantization_config=bnb_config,
-    device_map={"": 0},   # ← force everything to cuda:0
-    trust_remote_code=True,
+        model_name,
+        quantization_config=bnb_config,
+        device_map={"": 0},
+        torch_dtype=torch.bfloat16,   # ← add this so skipped modules use bf16
+        trust_remote_code=True,
     )
 
     processor = AutoProcessor.from_pretrained(
