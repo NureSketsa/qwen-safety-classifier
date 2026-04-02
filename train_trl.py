@@ -264,7 +264,7 @@ def main():
     
     local_rank=-1,
     ddp_find_unused_parameters=False,
-    no_cuda=False,
+    # no_cuda=False,
     )
 
     # ── Trainer
