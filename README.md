@@ -1,4 +1,5 @@
-# Qwen Safety Classifier
+
+# Qwen Safety Classifier v1
 
 Fine-tuning **Qwen3.5-0.8B-Instruct** with **QLoRA** for Indonesian content safety classification under UU ITE Pasal 28 Ayat 2.
 
