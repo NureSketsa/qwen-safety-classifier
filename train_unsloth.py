@@ -32,7 +32,6 @@ def make_hf_dataset(records):
     for r in records:
         msgs = r["messages"]
 
-        # ensure list
         if not isinstance(msgs, list):
             msgs = [{"role": "user", "content": str(msgs)}]
 
@@ -41,12 +40,21 @@ def make_hf_dataset(records):
             role = m.get("role", "user")
             content = m.get("content", "")
 
+            # ✅ FORCE EVERYTHING TO STRING HERE
+            if isinstance(content, list):
+                # extract text safely
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        text_parts.append(c.get("text", ""))
+                content = " ".join(text_parts)
+
             if content is None:
                 content = ""
 
             fixed_msgs.append({
                 "role": str(role),
-                "content": content,  # ✅ KEEP ORIGINAL STRUCTURE
+                "content": str(content),  # ✅ ALWAYS STRING
             })
 
         flat.append({
