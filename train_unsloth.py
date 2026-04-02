@@ -21,7 +21,7 @@ import torch
 import yaml
 from datasets import Dataset
 from PIL import Image
-from transformers import TrainingArguments
+from transformers import TrainingArguments,Trainer
 
 try:
     from unsloth import FastVisionModel
@@ -134,6 +134,33 @@ def load_model_and_processor(cfg: dict):
     return model, processor
 
 
+class UnslothVLMTrainer(Trainer):
+    """
+    Subclass that unpacks our collator's dict and explicitly calls
+    model(**inputs) to get the loss — bypassing Unsloth's patched
+    _unsloth_training_step which expects SFTTrainer's data layout.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+
+        # outputs is a CausalLMOutputWithPast; .loss is the CE loss tensor
+        loss = outputs.loss
+
+        if loss is None:
+            # Fallback: compute manually (shouldn't happen with labels set)
+            logits = outputs.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return (loss, outputs) if return_outputs else loss
+    
 # ── Training ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -201,13 +228,13 @@ def main():
     # ── Trainer — use base Trainer like TRL version (not SFTTrainer)
     # SFTTrainer tries to reprocess text which breaks our custom collator
     from transformers import Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=collator,
-    )
+    trainer = UnslothVLMTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=collator,
+# )
 
     # ── Train
     print("\nStarting Unsloth training ...")
