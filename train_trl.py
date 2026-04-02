@@ -127,9 +127,8 @@ def load_model_and_processor(cfg: dict):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,   # ← renamed from torch_dtype
+        bnb_4bit_compute_dtype=torch.float16,  # ← correct field name
         bnb_4bit_use_double_quant=True,
-        # ← removed llm_int8_skip_modules entirely
     )
 
     print(f"Loading model: {model_name}")
@@ -137,18 +136,20 @@ def load_model_and_processor(cfg: dict):
         model_name,
         quantization_config=bnb_config,
         device_map={"": 0},
-        torch_dtype=torch.float16,   # base dtype for non-quantized modules
+        torch_dtype=torch.float16,
         trust_remote_code=True,
     )
 
-    # Cast the vision encoder explicitly to float16 so .dtype works
-    model.visual = model.visual.to(torch.float16)
+    # Cast all non-quantized (float) submodules to float16
+    # so the vision encoder's .dtype property resolves correctly
+    for name, module in model.named_modules():
+        if any(p.is_floating_point() for p in module.parameters(recurse=False)):
+            try:
+                module.to(torch.float16)
+            except Exception:
+                pass
 
-    processor = AutoProcessor.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-    )
-
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
