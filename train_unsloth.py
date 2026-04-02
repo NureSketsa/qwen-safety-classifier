@@ -71,13 +71,33 @@ def convert_to_conversation(sample, processor):
 
     messages = sample["messages"]
 
-    # 🔥 CRITICAL: inject image token
-    if len(messages) > 0:
-        if "<image>" not in messages[0]["content"]:
-            messages[0]["content"] = "<image>\n" + messages[0]["content"]
+    fixed_messages = []
+
+    for m in messages:
+        role = m["role"]
+        content = m["content"]
+
+        # ❌ REMOVE broken multimodal string
+        if "{'type': 'image'}" in str(content):
+            continue
+
+        # 🔥 Ensure string
+        content = str(content)
+
+        fixed_messages.append({
+            "role": role,
+            "content": content
+        })
+
+    # 🔥 CRITICAL: inject image ONLY in USER message
+    for m in fixed_messages:
+        if m["role"] == "user":
+            if "<image>" not in m["content"]:
+                m["content"] = "<image>\n" + m["content"]
+            break
 
     return {
-        "messages": messages,
+        "messages": fixed_messages,
         "images": [image],
     }
 
