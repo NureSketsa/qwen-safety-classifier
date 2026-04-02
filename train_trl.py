@@ -133,11 +133,11 @@ def load_model_and_processor(cfg: dict):
     )
 
     print(f"Loading model: {model_name}")
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(  # ← changed
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map={"": 0},   # ← force everything to cuda:0
+    trust_remote_code=True,
     )
 
     processor = AutoProcessor.from_pretrained(
@@ -226,6 +226,8 @@ def main():
     report_to=train_cfg["report_to"],
     dataloader_num_workers=train_cfg["dataloader_num_workers"],
     remove_unused_columns=False,
+    no_cuda=False,
+    dataloader_pin_memory=False,  
     )
 
     # ── Trainer
