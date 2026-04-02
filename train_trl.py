@@ -155,6 +155,30 @@ def load_model_and_processor(cfg: dict):
             setattr(inner, attr, getattr(inner, attr).to(torch.float16))
             print(f"  Cast {attr} to float16")
             break
+    
+    import types
+
+    # Patch visual.dtype — after 4-bit quant all params are uint8,
+    # so the default `next(p for p in ... if p.is_floating_point())` raises StopIteration.
+    # Force it to always return float16.
+    visual_module = model.model.visual
+    visual_cls = type(visual_module)
+
+    # Only patch if not already patched
+    if not getattr(visual_cls, "_dtype_patched", False):
+        original_dtype_prop = visual_cls.__dict__.get("dtype")
+
+        def _patched_dtype(self):
+            # Try the original first; fall back to float16
+            try:
+                return next(
+                    p.dtype for p in self.parameters() if p.is_floating_point()
+                )
+            except StopIteration:
+                return torch.float16
+
+        visual_cls.dtype = property(_patched_dtype)
+        visual_cls._dtype_patched = True
         
     return model, processor
 
