@@ -240,7 +240,6 @@ def main():
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     data_collator=collator,
-    packing=False,
     )
 
     # ── Train
