@@ -142,17 +142,20 @@ def load_model_and_processor(cfg: dict):
 
     # Cast all non-quantized (float) submodules to float16
     # so the vision encoder's .dtype property resolves correctly
-    for name, module in model.named_modules():
-        if any(p.is_floating_point() for p in module.parameters(recurse=False)):
-            try:
-                module.to(torch.float16)
-            except Exception:
-                pass
+    model.model.visual = model.model.visual.to(torch.float16)
 
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+    # Defensive: find and cast the vision encoder regardless of attribute name
+    inner = model.model  # Qwen3_5Model
+    for attr in ("visual", "vision_model", "vision_encoder"):
+        if hasattr(inner, attr):
+            setattr(inner, attr, getattr(inner, attr).to(torch.float16))
+            print(f"  Cast {attr} to float16")
+            break
+        
     return model, processor
 
 
