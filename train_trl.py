@@ -205,6 +205,8 @@ def apply_lora(model, cfg: dict):
 
 
 def main():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+    
     parser = argparse.ArgumentParser(description="Train with TRL SFTTrainer")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
@@ -258,7 +260,11 @@ def main():
     report_to=train_cfg["report_to"],
     dataloader_num_workers=train_cfg["dataloader_num_workers"],
     remove_unused_columns=False,
-    dataloader_pin_memory=False,  
+    dataloader_pin_memory=False,
+    
+    local_rank=-1,
+    ddp_find_unused_parameters=False,
+    no_cuda=False,
     )
 
     # ── Trainer
