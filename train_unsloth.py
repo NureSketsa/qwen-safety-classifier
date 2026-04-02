@@ -42,8 +42,8 @@ def make_hf_dataset(records):
             content = m.get("content", "")
 
             # 🔥 critical fixes
-            if isinstance(content, list):
-                content = " ".join(map(str, content))
+            # if isinstance(content, list):
+            #     content = " ".join(map(str, content))
 
             if content is None:
                 content = ""
@@ -61,7 +61,20 @@ def make_hf_dataset(records):
 
     return Dataset.from_list(flat)
 
+def debug_sample(sample, idx=0):
+    print(f"\n===== DEBUG SAMPLE {idx} =====")
 
+    print("MESSAGES:")
+    for i, m in enumerate(sample["messages"]):
+        print(f"  [{i}] role={m['role']}")
+        print(f"       type={type(m['content'])}")
+        print(f"       content={m['content']}")
+
+    print("\nIMAGE PATH:", sample.get("image_path"))
+
+    print("=============================\n")
+    
+    
 def convert_to_conversation(sample, processor):
     try:
         image = Image.open(sample["image_path"]).convert("RGB")
@@ -86,6 +99,19 @@ def convert_to_conversation(sample, processor):
             if "<image>" not in m["content"]:
                 m["content"] = "<image>\n" + m["content"]
             break
+        
+    # ✅ ensure user exists
+    assert any(m["role"] == "user" for m in messages), "No user role!"
+
+    # ✅ ensure assistant exists
+    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
+
+    # ✅ ensure image placeholder exists
+    user_msg = next(m for m in messages if m["role"] == "user")
+    assert "<image>" in user_msg["content"], "Missing <image> token!"
+
+    # ✅ ensure image loaded
+    assert isinstance(image, Image.Image), "Invalid image!"
 
     return {
         "messages": messages,
@@ -121,7 +147,19 @@ def load_model_and_processor(cfg: dict):
 
     return model, processor
 
+def debug_converted(sample, idx=0):
+    print(f"\n===== CONVERTED SAMPLE {idx} =====")
 
+    print("MESSAGES:")
+    for i, m in enumerate(sample["messages"]):
+        print(f"  [{i}] role={m['role']}")
+        print(f"       content={m['content']}")
+
+    print("\nIMAGE COUNT:", len(sample["images"]))
+    print("IMAGE TYPE:", type(sample["images"][0]))
+
+    print("=================================\n")
+    
 def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -151,6 +189,7 @@ def main():
 
     # ── Convert datasets to {messages, images} format
     train_dataset = [convert_to_conversation(s, processor) for s in train_dataset]
+    debug_converted(train_dataset[0])
     val_dataset   = [convert_to_conversation(s, processor) for s in val_dataset]
 
     # ── Data collator — this is the key difference from your old version
@@ -197,7 +236,7 @@ def main():
         seed=ds_cfg["seed"],
     )
     
-    print(train_dataset[0])
+    debug_sample(train_dataset[0])
 
     # ── SFTTrainer
     import inspect
@@ -216,6 +255,19 @@ def main():
         trainer_kwargs["tokenizer"] = processor
 
     trainer = SFTTrainer(**trainer_kwargs)
+
+    # ✅ ensure user exists
+    assert any(m["role"] == "user" for m in messages), "No user role!"
+
+    # ✅ ensure assistant exists
+    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
+
+    # ✅ ensure image placeholder exists
+    user_msg = next(m for m in messages if m["role"] == "user")
+    assert "<image>" in user_msg["content"], "Missing <image> token!"
+
+    # ✅ ensure image loaded
+    assert isinstance(image, Image.Image), "Invalid image!"
 
     # ── Train
     print("\nStarting Unsloth training ...")
