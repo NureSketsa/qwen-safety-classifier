@@ -105,13 +105,11 @@ def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
     lora_cfg = cfg["lora"]
 
-    # Use Unsloth's pre-quantized version if available, fall back to HF name
-    # unsloth/ prefix gets Unsloth's optimized 4-bit weights directly
-    unsloth_name = model_name.replace("Qwen/", "unsloth/")
-    print(f"Loading model with Unsloth: {unsloth_name}")
+    # Don't remap to unsloth/ prefix — model may not exist there yet
+    print(f"Loading model with Unsloth: {model_name}")
 
     model, processor = FastVisionModel.from_pretrained(
-        model_name=unsloth_name,
+        model_name=model_name,   # uses "Qwen/Qwen3.5-0.8B-Instruct" directly
         load_in_4bit=True,
         use_gradient_checkpointing="unsloth",
     )
