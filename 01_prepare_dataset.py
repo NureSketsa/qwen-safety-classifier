@@ -53,17 +53,16 @@ def parse_image_name(
     image_name: str, class_folders: dict, image_root: Path
 ) -> Path | None:
     """
-    Parse '1_126.jpg'  →  image_root/class_1/126.jpg
-    The part before the FIRST underscore is the class index.
-    Everything after (including further underscores) is the filename.
+    Parse '1_126.jpg' → image_root/class_1/1_126.jpg
+    (KEEP full filename, only use prefix to find folder)
     """
-    name = Path(image_name).name  # strip any accidental directory
-    parts = name.split("_", 1)  # split on FIRST underscore only
+    name = Path(image_name).name
 
+    parts = name.split("_", 1)
     if len(parts) != 2:
         return None
 
-    class_idx_str, filename = parts
+    class_idx_str = parts[0]
 
     try:
         class_idx = int(class_idx_str)
@@ -74,7 +73,8 @@ def parse_image_name(
     if folder_name is None:
         return None
 
-    return image_root / folder_name / filename
+    # ✅ KEEP FULL NAME
+    return image_root / folder_name / name
 
 
 def build_messages(row: pd.Series, system_prompt: str) -> dict:
