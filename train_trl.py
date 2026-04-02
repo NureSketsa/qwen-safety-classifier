@@ -53,7 +53,6 @@ def make_hf_dataset(records):
             "messages_json": json.dumps(r["messages"], ensure_ascii=False),
             "image_path": r["image_path"],
             "label": r.get("label", ""),
-            "text": "",   # ← dummy field to satisfy SFTTrainer
         })
     return Dataset.from_list(flat)
 
@@ -241,7 +240,6 @@ def main():
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     data_collator=collator,
-    dataset_text_field="text",   # points to the dummy empty field
     packing=False,
     )
 
