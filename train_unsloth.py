@@ -12,6 +12,7 @@ Usage:
   python train_unsloth.py --config config.yaml --resume
 """
 
+import unsloth
 import argparse
 import json
 import os
@@ -239,7 +240,15 @@ def main():
     # ── Train
     print("\nStarting Unsloth training ...")
     resume_ckpt = output_dir if args.resume else None
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    print(f"GPU memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    print(f"GPU memory reserved:  {torch.cuda.memory_reserved()/1e9:.2f} GB")
+    
+    try:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print("\n💥 OOM! Free memory:", torch.cuda.memory_summary())
+        raise
 
     # ── Save adapter
     final_path = Path(output_dir) / "final_adapter"
