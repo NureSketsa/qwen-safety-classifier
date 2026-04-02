@@ -41,16 +41,12 @@ def make_hf_dataset(records):
             role = m.get("role", "user")
             content = m.get("content", "")
 
-            # 🔥 critical fixes
-            # if isinstance(content, list):
-            #     content = " ".join(map(str, content))
-
             if content is None:
                 content = ""
 
             fixed_msgs.append({
                 "role": str(role),
-                "content": str(content),
+                "content": content,  # ✅ KEEP ORIGINAL STRUCTURE
             })
 
         flat.append({
@@ -84,6 +80,10 @@ def convert_to_conversation(sample, processor):
 
     messages = sample["messages"]
 
+    # ✅ ASSERTS HERE (correct place)
+    assert any(m["role"] == "user" for m in messages), "No user role!"
+    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
+
     # 🔥 ensure user exists
     has_user = any(m["role"] == "user" for m in messages)
 
@@ -96,8 +96,15 @@ def convert_to_conversation(sample, processor):
     # 🔥 ensure <image> is in user
     for m in messages:
         if m["role"] == "user":
-            if "<image>" not in m["content"]:
-                m["content"] = "<image>\n" + m["content"]
+            # if already structured → leave it
+            if isinstance(m["content"], list):
+                break
+
+            # if string → convert to structured
+            m["content"] = [
+                {"type": "image"},
+                {"type": "text", "text": m["content"]}
+            ]
             break
         
     # ✅ ensure user exists
@@ -255,19 +262,6 @@ def main():
         trainer_kwargs["tokenizer"] = processor
 
     trainer = SFTTrainer(**trainer_kwargs)
-
-    # ✅ ensure user exists
-    assert any(m["role"] == "user" for m in messages), "No user role!"
-
-    # ✅ ensure assistant exists
-    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
-
-    # ✅ ensure image placeholder exists
-    user_msg = next(m for m in messages if m["role"] == "user")
-    assert "<image>" in user_msg["content"], "Missing <image> token!"
-
-    # ✅ ensure image loaded
-    assert isinstance(image, Image.Image), "Invalid image!"
 
     # ── Train
     print("\nStarting Unsloth training ...")
