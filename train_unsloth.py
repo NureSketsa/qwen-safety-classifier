@@ -71,36 +71,26 @@ def convert_to_conversation(sample, processor):
 
     messages = sample["messages"]
 
-    fixed_messages = []
+    # 🔥 ensure user exists
+    has_user = any(m["role"] == "user" for m in messages)
 
-    for m in messages:
-        role = m["role"]
-        content = m["content"]
-
-        # ❌ REMOVE broken multimodal string
-        if "{'type': 'image'}" in str(content):
-            continue
-
-        # 🔥 Ensure string
-        content = str(content)
-
-        fixed_messages.append({
-            "role": role,
-            "content": content
+    if not has_user:
+        messages.insert(1, {   # after system
+            "role": "user",
+            "content": "<image>\nAnalisis gambar berikut dan tentukan apakah konten ini SAFE atau UNSAFE."
         })
 
-    # 🔥 CRITICAL: inject image ONLY in USER message
-    for m in fixed_messages:
+    # 🔥 ensure <image> is in user
+    for m in messages:
         if m["role"] == "user":
             if "<image>" not in m["content"]:
                 m["content"] = "<image>\n" + m["content"]
             break
 
     return {
-        "messages": fixed_messages,
+        "messages": messages,
         "images": [image],
     }
-
 
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
