@@ -49,13 +49,12 @@ def load_json_dataset(json_path: str) -> list[dict]:
 def make_hf_dataset(records):
     flat = []
     for r in records:
-        flat.append(
-            {
-                "messages_json": json.dumps(r["messages"], ensure_ascii=False),
-                "image_path": r["image_path"],
-                "label": r.get("label", ""),
-            }
-        )
+        flat.append({
+            "messages_json": json.dumps(r["messages"], ensure_ascii=False),
+            "image_path": r["image_path"],
+            "label": r.get("label", ""),
+            "text": "",   # ← dummy field to satisfy SFTTrainer
+        })
     return Dataset.from_list(flat)
 
 
@@ -237,12 +236,13 @@ def main():
 
     # ── Trainer
     trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=collator,
-        # dataset_text_field not used — collator handles everything
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=collator,
+    dataset_text_field="text",   # points to the dummy empty field
+    packing=False,
     )
 
     # ── Train
