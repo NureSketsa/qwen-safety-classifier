@@ -59,20 +59,16 @@ def load_json_dataset(json_path: str) -> list[dict]:
 
 
 def make_hf_dataset(records):
-    from datasets import Dataset
-
-    # --- TAMBAHKAN KODE NORMALISASI INI ---
-    for record in records:
-        if "images" in record:
-            # Jika images berupa string, paksa menjadi list
-            if isinstance(record["images"], str):
-                record["images"] = [record["images"]]
-            # Jika images kosong (None), jadikan list kosong
-            elif record["images"] is None:
-                record["images"] = []
-    # --------------------------------------
-
-    return Dataset.from_list(records)
+    flat = []
+    for r in records:
+        flat.append(
+            {
+                "messages_json": json.dumps(r["messages"], ensure_ascii=False),
+                "image_path": r["image_path"],
+                "label": r.get("label", ""),
+            }
+        )
+    return Dataset.from_list(flat)
 
 
 # ── Collator ─────────────────────────────────────────────────────────────────
@@ -92,16 +88,20 @@ class UnslothVLMCollator:
         images = []
 
         for sample in batch:
+            img_path = sample["image_path"]
             try:
-                image = Image.open(sample["image_path"]).convert("RGB")
+                image = Image.open(img_path).convert("RGB")
             except Exception as e:
-                print(f"[WARN] {sample['image_path']}: {e}")
-                image = Image.new("RGB", (224, 224), (128, 128, 128))
+                print(f"[WARN] Cannot load image {img_path}: {e}")
+                image = Image.new("RGB", (224, 224), color=(128, 128, 128))
 
             images.append(image)
 
+            # Deserialize messages back from JSON string
+            messages = json.loads(sample["messages_json"])  # ← add this
+
             text = self.processor.apply_chat_template(
-                sample["messages"],
+                messages,  # ← use messages, not sample["messages"]
                 tokenize=False,
                 add_generation_prompt=False,
             )
