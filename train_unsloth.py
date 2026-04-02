@@ -27,14 +27,39 @@ def load_json_dataset(json_path: str) -> list[dict]:
 
 
 def make_hf_dataset(records):
-    return Dataset.from_list([
-        {
-            "messages":   r["messages"],       # keep as list, NOT json string
-            "image_path": r["image_path"],
-            "label":      r.get("label", ""),
-        }
-        for r in records
-    ])
+    flat = []
+
+    for r in records:
+        msgs = r["messages"]
+
+        # ensure list
+        if not isinstance(msgs, list):
+            msgs = [{"role": "user", "content": str(msgs)}]
+
+        fixed_msgs = []
+        for m in msgs:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+
+            # 🔥 critical fixes
+            if isinstance(content, list):
+                content = " ".join(map(str, content))
+
+            if content is None:
+                content = ""
+
+            fixed_msgs.append({
+                "role": str(role),
+                "content": str(content),
+            })
+
+        flat.append({
+            "messages": fixed_msgs,
+            "image_path": str(r["image_path"]),
+            "label": str(r.get("label", "")),
+        })
+
+    return Dataset.from_list(flat)
 
 
 def convert_to_conversation(sample, processor):
