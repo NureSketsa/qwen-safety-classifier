@@ -127,18 +127,22 @@ def load_model_and_processor(cfg: dict):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        torch_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.float16,   # ← renamed from torch_dtype
         bnb_4bit_use_double_quant=True,
-        llm_int8_skip_modules=["visual", "lm_head"],  # ← exclude vision encoder
+        # ← removed llm_int8_skip_modules entirely
     )
+
     print(f"Loading model: {model_name}")
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         device_map={"": 0},
-        torch_dtype=torch.bfloat16,   # ← add this so skipped modules use bf16
+        torch_dtype=torch.float16,   # base dtype for non-quantized modules
         trust_remote_code=True,
     )
+
+    # Cast the vision encoder explicitly to float16 so .dtype works
+    model.visual = model.visual.to(torch.float16)
 
     processor = AutoProcessor.from_pretrained(
         model_name,
