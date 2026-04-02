@@ -80,42 +80,43 @@ def convert_to_conversation(sample, processor):
 
     messages = sample["messages"]
 
-    # ✅ ASSERTS HERE (correct place)
+    # ✅ ensure roles exist
     assert any(m["role"] == "user" for m in messages), "No user role!"
     assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
 
-    # 🔥 ensure user exists
-    has_user = any(m["role"] == "user" for m in messages)
-
-    if not has_user:
-        messages.insert(1, {   # after system
-            "role": "user",
-            "content": "<image>\nAnalisis gambar berikut dan tentukan apakah konten ini SAFE atau UNSAFE."
-        })
-
-    # 🔥 ensure <image> is in user
+    # 🔥 ensure user message is MULTIMODAL STRUCTURED
     for m in messages:
         if m["role"] == "user":
-            # if already structured → leave it
+
+            # already correct → skip
             if isinstance(m["content"], list):
                 break
 
-            # if string → convert to structured
+            # convert string → structured
+            text = m["content"] if m["content"] is not None else ""
+
             m["content"] = [
                 {"type": "image"},
-                {"type": "text", "text": m["content"]}
+                {"type": "text", "text": text}
             ]
             break
-        
-    # ✅ ensure user exists
-    assert any(m["role"] == "user" for m in messages), "No user role!"
 
-    # ✅ ensure assistant exists
-    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
-
-    # ✅ ensure image placeholder exists
+    # ✅ VALIDATION (UPDATED FOR STRUCTURED FORMAT)
     user_msg = next(m for m in messages if m["role"] == "user")
-    assert "<image>" in user_msg["content"], "Missing <image> token!"
+
+    assert isinstance(user_msg["content"], list), "User content must be list!"
+
+    # must contain image block
+    assert any(
+        isinstance(c, dict) and c.get("type") == "image"
+        for c in user_msg["content"]
+    ), "Missing image block!"
+
+    # must contain text block
+    assert any(
+        isinstance(c, dict) and c.get("type") == "text"
+        for c in user_msg["content"]
+    ), "Missing text block!"
 
     # ✅ ensure image loaded
     assert isinstance(image, Image.Image), "Invalid image!"
