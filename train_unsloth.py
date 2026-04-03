@@ -16,10 +16,37 @@ from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
 
+"""
+train_unsloth.py
+================
+Fine-tune Qwen3.5-0.8B with Unsloth (~3GB VRAM, 2-2.7x faster).
+
+Usage:
+  python train_unsloth.py
+  python train_unsloth.py --config config/config_unsloth.yaml --base_config config/config_base.yaml --resume
+"""
+
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def merge_configs(base: dict, override: dict) -> dict:
+    """Deep merge: override takes priority over base."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = merge_configs(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
 
 
 def load_json_dataset(json_path: str) -> list[dict]:
@@ -41,9 +68,7 @@ def make_hf_dataset(records):
             role = m.get("role", "user")
             content = m.get("content", "")
 
-            # ✅ FORCE EVERYTHING TO STRING HERE
             if isinstance(content, list):
-                # extract text safely
                 text_parts = []
                 for c in content:
                     if isinstance(c, dict) and c.get("type") == "text":
@@ -53,12 +78,7 @@ def make_hf_dataset(records):
             if content is None:
                 content = ""
 
-            fixed_msgs.append(
-                {
-                    "role": str(role),
-                    "content": str(content),  # ✅ ALWAYS STRING
-                }
-            )
+            fixed_msgs.append({"role": str(role), "content": str(content)})
 
         flat.append(
             {
@@ -73,15 +93,12 @@ def make_hf_dataset(records):
 
 def debug_sample(sample, idx=0):
     print(f"\n===== DEBUG SAMPLE {idx} =====")
-
     print("MESSAGES:")
     for i, m in enumerate(sample["messages"]):
         print(f"  [{i}] role={m['role']}")
         print(f"       type={type(m['content'])}")
         print(f"       content={m['content']}")
-
     print("\nIMAGE PATH:", sample.get("image_path"))
-
     print("=============================\n")
 
 
@@ -94,46 +111,28 @@ def convert_to_conversation(sample, processor):
 
     messages = sample["messages"]
 
-    # ✅ ensure roles exist
     assert any(m["role"] == "user" for m in messages), "No user role!"
     assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
 
-    # 🔥 ensure user message is MULTIMODAL STRUCTURED
     for m in messages:
         if m["role"] == "user":
-
-            # already correct → skip
             if isinstance(m["content"], list):
                 break
-
-            # convert string → structured
             text = m["content"] if m["content"] is not None else ""
-
             m["content"] = [{"type": "image"}, {"type": "text", "text": text}]
             break
 
-    # ✅ VALIDATION (UPDATED FOR STRUCTURED FORMAT)
     user_msg = next(m for m in messages if m["role"] == "user")
-
     assert isinstance(user_msg["content"], list), "User content must be list!"
-
-    # must contain image block
     assert any(
         isinstance(c, dict) and c.get("type") == "image" for c in user_msg["content"]
     ), "Missing image block!"
-
-    # must contain text block
     assert any(
         isinstance(c, dict) and c.get("type") == "text" for c in user_msg["content"]
     ), "Missing text block!"
-
-    # ✅ ensure image loaded
     assert isinstance(image, Image.Image), "Invalid image!"
 
-    return {
-        "messages": messages,
-        "images": [image],
-    }
+    return {"messages": messages, "images": [image]}
 
 
 def load_model_and_processor(cfg: dict):
@@ -146,7 +145,7 @@ def load_model_and_processor(cfg: dict):
         model_name=model_name,
         max_seq_length=cfg["model"]["max_seq_length"],
         load_in_4bit=True,
-        dtype=None,  # auto-detect, avoids the float32 warning
+        dtype=None,
     )
 
     model = FastLanguageModel.get_peft_model(
@@ -168,20 +167,16 @@ def load_model_and_processor(cfg: dict):
 
 def debug_converted(sample, idx=0):
     print(f"\n===== CONVERTED SAMPLE {idx} =====")
-
     print("MESSAGES:")
     for i, m in enumerate(sample["messages"]):
         print(f"  [{i}] role={m['role']}")
         print(f"       content={m['content']}")
-
     print("\nIMAGE COUNT:", len(sample["images"]))
     print("IMAGE TYPE:", type(sample["images"][0]))
-
     print("=================================\n")
 
 
 def fits_in_context(sample, processor, max_seq_length):
-    """Return True if the sample tokenizes within max_seq_length."""
     try:
         text = processor.apply_chat_template(
             sample["messages"], tokenize=False, add_generation_prompt=False
@@ -196,11 +191,16 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default="config/config_unsloth.yaml")
+    parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    # Load and merge: base first, then unsloth overrides
+    base_cfg = load_config(args.base_config)
+    unsloth_cfg = load_config(args.config)
+    cfg = merge_configs(base_cfg, unsloth_cfg)
+
     train_cfg = cfg["training"]
     ds_cfg = cfg["dataset"]
 
@@ -216,15 +216,15 @@ def main():
     # ── Load model
     model, processor = load_model_and_processor(cfg)
 
-    # ── Switch to training mode (Unsloth-specific, must be before SFTTrainer)
+    # ── Switch to training mode
     FastVisionModel.for_training(model)
 
-    # ── Convert datasets to {messages, images} format
+    # ── Convert datasets
     train_dataset = [convert_to_conversation(s, processor) for s in train_dataset]
     debug_converted(train_dataset[0])
     val_dataset = [convert_to_conversation(s, processor) for s in val_dataset]
 
-    # ── Data collator — this is the key difference from your old version
+    # ── Data collator
     data_collator = UnslothVisionDataCollator(
         model,
         processor,
@@ -234,7 +234,7 @@ def main():
     )
 
     # ── SFTConfig
-    output_dir = train_cfg["output_dir_unsloth"]
+    output_dir = train_cfg["output_dir"]  # ← was output_dir_unsloth
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     use_bf16 = torch.cuda.is_bf16_supported()
@@ -249,7 +249,7 @@ def main():
         lr_scheduler_type=train_cfg["lr_scheduler_type"],
         warmup_steps=train_cfg["warmup_steps"],
         weight_decay=train_cfg["weight_decay"],
-        optim="adamw_8bit",  # ← Unsloth's optimized optimizer
+        optim="adamw_8bit",
         bf16=use_bf16,
         fp16=not use_bf16,
         save_strategy=train_cfg["save_strategy"],
@@ -259,9 +259,8 @@ def main():
         logging_steps=train_cfg["logging_steps"],
         load_best_model_at_end=False,
         report_to=train_cfg["report_to"],
-        dataloader_num_workers=0,  # ← 0 prevents multiprocessing PIL issues
+        dataloader_num_workers=0,
         remove_unused_columns=False,
-        # ── Critical: skip TRL's internal dataset processing
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=cfg["model"]["max_seq_length"],
@@ -288,7 +287,6 @@ def main():
         "eval_dataset": val_dataset,
         "data_collator": data_collator,
     }
-    # TRL 0.12+ renamed tokenizer → processing_class
     if "processing_class" in trainer_params:
         trainer_kwargs["processing_class"] = processor
     else:
@@ -308,7 +306,7 @@ def main():
     print(f"\n✓ Adapter saved: {final_path}")
 
     # ── Merge to fp16
-    merge_path = Path(cfg["merge"]["unsloth_merged"])
+    merge_path = Path(cfg["merge"]["merged"])  # ← was merge["unsloth_merged"]
     merge_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained_merged(str(merge_path), processor, save_method="merged_16bit")
     print(f"✓ Merged model saved: {merge_path}")

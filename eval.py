@@ -12,8 +12,8 @@ Metrics computed:
   - Confusion matrix
 
 Usage:
-  python eval.py --checkpoint output/trl_checkpoint/final_adapter
-  python eval.py --checkpoint output/unsloth_merged --merged
+  python eval.py --checkpoint output/trl_checkpoint/final_adapter --config config/config_trl.yaml
+  python eval.py --checkpoint output/unsloth_merged --merged      --config config/config_unsloth.yaml
   python eval.py --checkpoint output/trl_checkpoint/final_adapter --n 50  # manual eval subset
 """
 
@@ -36,18 +36,27 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def merge_configs(base: dict, override: dict) -> dict:
+    """Deep merge: override takes priority over base."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = merge_configs(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 # ── Inference ────────────────────────────────────────────────────────────────
 
 
 def load_model(checkpoint: str, merged: bool, cfg: dict):
-    """Load model for inference (not training)."""
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     from peft import PeftModel
 
     model_name = cfg["model"]["name"]
 
     if merged:
-        # Merged model: load directly
         print(f"Loading merged model from: {checkpoint}")
         from transformers import BitsAndBytesConfig
 
@@ -64,7 +73,6 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
         )
         processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
     else:
-        # LoRA adapter on top of base model
         print(f"Loading base model: {model_name}")
         print(f"Loading adapter:    {checkpoint}")
         from transformers import BitsAndBytesConfig
@@ -88,13 +96,7 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
     return model, processor
 
 
-def run_inference(
-    model,
-    processor,
-    sample: dict,
-    max_new_tokens: int = 512,
-) -> str:
-    """Run model inference on a single sample. Returns raw text output."""
+def run_inference(model, processor, sample: dict, max_new_tokens: int = 512) -> str:
     img_path = sample["image_path"]
     messages = sample["messages"]
 
@@ -104,7 +106,6 @@ def run_inference(
         print(f"[WARN] Cannot load {img_path}: {e}")
         image = Image.new("RGB", (224, 224), (128, 128, 128))
 
-    # Build prompt (no assistant turn → generation prompt)
     prompt_messages = [m for m in messages if m["role"] != "assistant"]
     text = processor.apply_chat_template(
         prompt_messages,
@@ -122,33 +123,24 @@ def run_inference(
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,  # greedy — deterministic eval
+            do_sample=False,
             temperature=None,
             top_p=None,
         )
 
-    # Decode only the generated tokens (skip prompt)
     input_len = inputs["input_ids"].shape[1]
     generated = output_ids[0][input_len:]
     return processor.decode(generated, skip_special_tokens=True).strip()
 
 
 def parse_output(text: str) -> tuple[str, str]:
-    """
-    Parse model output into (label, reasoning).
-    Expected format:
-      REASONING: <text>
-      LABEL: SAFE|UNSAFE
-    """
     label = "UNKNOWN"
     reasoning = text
 
-    # Extract LABEL
     label_match = re.search(r"LABEL\s*:\s*(SAFE|UNSAFE)", text, re.IGNORECASE)
     if label_match:
         label = label_match.group(1).upper()
 
-    # Extract REASONING
     reasoning_match = re.search(
         r"REASONING\s*:\s*(.+?)(?=\nLABEL\s*:|$)", text, re.DOTALL | re.IGNORECASE
     )
@@ -170,9 +162,7 @@ def compute_classification_metrics(y_true: list[str], y_pred: list[str]) -> dict
         precision_score,
         roc_auc_score,
     )
-    import numpy as np
 
-    # Binary encode: UNSAFE=1, SAFE=0
     label_map = {"UNSAFE": 1, "SAFE": 0, "UNKNOWN": 0}
     y_true_bin = [label_map.get(l, 0) for l in y_true]
     y_pred_bin = [label_map.get(l, 0) for l in y_pred]
@@ -188,17 +178,13 @@ def compute_classification_metrics(y_true: list[str], y_pred: list[str]) -> dict
         ),
     }
 
-    # AUC-ROC (requires at least 2 classes in true labels)
     if len(set(y_true_bin)) > 1:
         results["auc_roc"] = roc_auc_score(y_true_bin, y_pred_bin)
     else:
         results["auc_roc"] = None
 
-    # Confusion matrix
     cm = confusion_matrix(y_true_bin, y_pred_bin, labels=[0, 1])
     results["confusion_matrix"] = cm.tolist()
-
-    # Full classification report
     results["report"] = classification_report(
         y_true_bin,
         y_pred_bin,
@@ -239,19 +225,20 @@ def main():
     parser.add_argument(
         "--checkpoint", required=True, help="Path to adapter or merged model dir"
     )
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default="config/config_trl.yaml")
+    parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument(
         "--merged", action="store_true", help="Checkpoint is a merged model"
     )
-    parser.add_argument(
-        "--n", type=int, default=None, help="Limit to N samples (manual eval)"
-    )
-    parser.add_argument(
-        "--split", default="val", choices=["train", "val"], help="Which split to eval"
-    )
+    parser.add_argument("--n", type=int, default=None, help="Limit to N samples")
+    parser.add_argument("--split", default="val", choices=["train", "val"])
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    # Load and merge configs
+    base_cfg = load_config(args.base_config)
+    specific_cfg = load_config(args.config)
+    cfg = merge_configs(base_cfg, specific_cfg)
+
     ds_cfg = cfg["dataset"]
     ev_cfg = cfg["eval"]
 
@@ -276,9 +263,7 @@ def main():
     ref_reasonings = []
 
     for sample in tqdm(records, desc="Inference"):
-        # Ground truth
         gt_label = sample.get("label", "UNKNOWN").upper()
-        # Extract reference reasoning from assistant message
         gt_reasoning = ""
         for msg in sample["messages"]:
             if msg["role"] == "assistant":
@@ -291,7 +276,6 @@ def main():
                 if r_match:
                     gt_reasoning = r_match.group(1).strip()
 
-        # Model output
         raw_output = run_inference(model, processor, sample, max_new_tokens)
         pred_label, pred_reasoning = parse_output(raw_output)
 
@@ -329,7 +313,9 @@ def main():
         print(f"BERTScore F1        : {bs_metrics['bertscore_f1']:.4f}")
 
     # ── Save results
-    results_dir = Path(ev_cfg["results_dir"])
+    results_dir = Path(
+        ev_cfg["results_dir"]
+    )  # ← trl → .../trl  |  unsloth → .../unsloth
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results = {

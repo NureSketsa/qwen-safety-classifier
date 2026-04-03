@@ -8,7 +8,7 @@ Environment: Kaggle / Colab / Local (requires ~6GB VRAM)
 
 Usage:
   python train_trl.py
-  python train_trl.py --config config.yaml --resume
+  python train_trl.py --config config/config_trl.yaml --base_config config/config_base.yaml --resume
 """
 
 import argparse
@@ -24,7 +24,7 @@ from PIL import Image
 from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
-    Qwen3_5ForConditionalGeneration,   # ← was Qwen2_5_VLForConditionalGeneration
+    Qwen3_5ForConditionalGeneration,
     TrainingArguments,
     Trainer,
 )
@@ -35,6 +35,17 @@ from transformers import (
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def merge_configs(base: dict, override: dict) -> dict:
+    """Deep merge: override takes priority over base."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = merge_configs(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
@@ -48,11 +59,13 @@ def load_json_dataset(json_path: str) -> list[dict]:
 def make_hf_dataset(records):
     flat = []
     for r in records:
-        flat.append({
-            "messages_json": json.dumps(r["messages"], ensure_ascii=False),
-            "image_path": r["image_path"],
-            "label": r.get("label", ""),
-        })
+        flat.append(
+            {
+                "messages_json": json.dumps(r["messages"], ensure_ascii=False),
+                "image_path": r["image_path"],
+                "label": r.get("label", ""),
+            }
+        )
     return Dataset.from_list(flat)
 
 
@@ -60,16 +73,6 @@ def make_hf_dataset(records):
 
 
 class VLMDataCollator:
-    """
-    Collate a batch of VLM samples.
-    Each sample has:
-      - messages: list of chat messages (system / user with image / assistant)
-      - image_path: str path to the image file
-
-    The collator applies the processor's chat template and loads images,
-    then returns tensors ready for the model.
-    """
-
     def __init__(self, processor, max_seq_length: int = 2048):
         self.processor = processor
         self.max_seq_length = max_seq_length
@@ -88,17 +91,15 @@ class VLMDataCollator:
 
             images.append(image)
 
-            # Deserialize messages back from JSON string
-            messages = json.loads(sample["messages_json"])  # ← add this
+            messages = json.loads(sample["messages_json"])
 
             text = self.processor.apply_chat_template(
-                messages,  # ← use messages, not sample["messages"]
+                messages,
                 tokenize=False,
                 add_generation_prompt=False,
             )
             texts.append(text)
 
-        # Tokenize + image processing
         encoding = self.processor(
             text=texts,
             images=images,
@@ -108,12 +109,8 @@ class VLMDataCollator:
             max_length=self.max_seq_length,
         )
 
-        # Labels = input_ids with padding masked to -100
         labels = encoding["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
-
-        # Mask the prompt (everything before assistant turn) from loss
-        # Simple approach: mask up to the last occurrence of assistant token
         encoding["labels"] = labels
 
         return encoding
@@ -121,13 +118,14 @@ class VLMDataCollator:
 
 # ── Model Setup ──────────────────────────────────────────────────────────────
 
+
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,  # ← correct field name
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -140,46 +138,35 @@ def load_model_and_processor(cfg: dict):
         trust_remote_code=True,
     )
 
-    # Cast all non-quantized (float) submodules to float16
-    # so the vision encoder's .dtype property resolves correctly
     model.model.visual = model.model.visual.to(torch.float16)
 
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    # Defensive: find and cast the vision encoder regardless of attribute name
-    inner = model.model  # Qwen3_5Model
+    inner = model.model
     for attr in ("visual", "vision_model", "vision_encoder"):
         if hasattr(inner, attr):
             setattr(inner, attr, getattr(inner, attr).to(torch.float16))
             print(f"  Cast {attr} to float16")
             break
-    
+
     import types
 
-    # Patch visual.dtype — after 4-bit quant all params are uint8,
-    # so the default `next(p for p in ... if p.is_floating_point())` raises StopIteration.
-    # Force it to always return float16.
     visual_module = model.model.visual
     visual_cls = type(visual_module)
 
-    # Only patch if not already patched
     if not getattr(visual_cls, "_dtype_patched", False):
-        original_dtype_prop = visual_cls.__dict__.get("dtype")
 
         def _patched_dtype(self):
-            # Try the original first; fall back to float16
             try:
-                return next(
-                    p.dtype for p in self.parameters() if p.is_floating_point()
-                )
+                return next(p.dtype for p in self.parameters() if p.is_floating_point())
             except StopIteration:
                 return torch.float16
 
         visual_cls.dtype = property(_patched_dtype)
         visual_cls._dtype_patched = True
-        
+
     return model, processor
 
 
@@ -205,16 +192,21 @@ def apply_lora(model, cfg: dict):
 
 
 def main():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
-    
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
     parser = argparse.ArgumentParser(description="Train with TRL SFTTrainer")
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default="config/config_trl.yaml")
+    parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument(
         "--resume", action="store_true", help="Resume from last checkpoint"
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    # Load and merge: base first, then trl overrides
+    base_cfg = load_config(args.base_config)
+    trl_cfg = load_config(args.config)
+    cfg = merge_configs(base_cfg, trl_cfg)
+
     train_cfg = cfg["training"]
     ds_cfg = cfg["dataset"]
 
@@ -235,45 +227,43 @@ def main():
     collator = VLMDataCollator(processor, max_seq_length=cfg["model"]["max_seq_length"])
 
     # ── TrainingArguments
-    output_dir = train_cfg["output_dir_trl"]
+    output_dir = train_cfg["output_dir"]  # ← was output_dir_trl
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     training_args = TrainingArguments(
-    output_dir=output_dir,
-    num_train_epochs=train_cfg["num_train_epochs"],
-    per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
-    per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
-    gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
-    learning_rate=train_cfg["learning_rate"],
-    lr_scheduler_type=train_cfg["lr_scheduler_type"],
-    warmup_steps=train_cfg["warmup_steps"],
-    weight_decay=train_cfg["weight_decay"],
-    optim=train_cfg["optim"],
-    bf16=train_cfg["bf16"],
-    fp16=train_cfg["fp16"],
-    save_strategy=train_cfg["save_strategy"],
-    save_steps=train_cfg["save_steps"],
-    eval_strategy=train_cfg["eval_strategy"],
-    eval_steps=train_cfg["eval_steps"],
-    logging_steps=train_cfg["logging_steps"],
-    load_best_model_at_end=False,   # ← disable, needs eval metric
-    report_to=train_cfg["report_to"],
-    dataloader_num_workers=train_cfg["dataloader_num_workers"],
-    remove_unused_columns=False,
-    dataloader_pin_memory=False,
-    
-    local_rank=-1,
-    ddp_find_unused_parameters=False,
-    # no_cuda=False,
+        output_dir=output_dir,
+        num_train_epochs=train_cfg["num_train_epochs"],
+        per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
+        per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
+        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
+        learning_rate=train_cfg["learning_rate"],
+        lr_scheduler_type=train_cfg["lr_scheduler_type"],
+        warmup_steps=train_cfg["warmup_steps"],
+        weight_decay=train_cfg["weight_decay"],
+        optim=train_cfg["optim"],
+        bf16=train_cfg["bf16"],
+        fp16=train_cfg["fp16"],
+        save_strategy=train_cfg["save_strategy"],
+        save_steps=train_cfg["save_steps"],
+        eval_strategy=train_cfg["eval_strategy"],
+        eval_steps=train_cfg["eval_steps"],
+        logging_steps=train_cfg["logging_steps"],
+        load_best_model_at_end=False,
+        report_to=train_cfg["report_to"],
+        dataloader_num_workers=train_cfg["dataloader_num_workers"],
+        remove_unused_columns=False,
+        dataloader_pin_memory=False,
+        local_rank=-1,
+        ddp_find_unused_parameters=False,
     )
 
     # ── Trainer
     trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    data_collator=collator,
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=collator,
     )
 
     # ── Train

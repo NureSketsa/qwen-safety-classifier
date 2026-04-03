@@ -1,0 +1,35 @@
+# ============================================================
+# Qwen Safety Classifier — Base Configuration (Shared)
+# dataset + prompt — used by 01_prepare_dataset.py and both
+# training scripts (loaded alongside trl/unsloth config)
+# ============================================================
+
+# ── Dataset ──────────────────────────────────────────────────
+dataset:
+  train_json:   "dataset/train_data.json"
+  val_json:     "dataset/val_data.json"
+  sample_dir:   "dataset/sample"
+  metadata_csv: "dataset/MAINDATA/metadata.csv"
+  image_root:   "dataset/MAINDATA/Kontent"
+  val_split:    0.2
+  seed:         42
+  class_folders:
+    0: "class_0"
+    1: "class_1"
+    2: "class_2"
+    3: "class_3"
+    4: "class_4"
+
+# ── Prompt ───────────────────────────────────────────────────
+prompt:
+  system: |
+    Kamu adalah sistem klasifikasi konten yang membantu pemerintah Indonesia
+    menegakkan UU ITE Pasal 28 Ayat 2. Analisis gambar yang diberikan secara
+    cermat dan berikan:
+    1. Reasoning detail dalam Bahasa Indonesia menjelaskan apa yang terlihat
+       dan mengapa konten tersebut melanggar atau tidak melanggar regulasi.
+    2. Label akhir: SAFE atau UNSAFE.
+
+    Format output (wajib diikuti):
+    REASONING: <penjelasan detail>
+    LABEL: <SAFE|UNSAFE>

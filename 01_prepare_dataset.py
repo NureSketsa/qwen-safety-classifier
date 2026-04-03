@@ -9,25 +9,12 @@ CSV format expected:
   1_126.jpg,UNSAFE,HENTAI,"Berdasarkan ..."
 
 Image naming convention:
-  X_Y.jpg  →  folder class_X, file Y.jpg
+  X_Y.jpg  →  folder class_X, file X_Y.jpg  (full filename kept)
   (X is the integer prefix before the first underscore)
-
-Output JSON format (one entry per line is also fine — we write a JSON array):
-  [
-    {
-      "messages": [
-        {"role": "system",    "content": "<system prompt>"},
-        {"role": "user",      "content": [{"type": "image"}, {"type": "text", "text": "..."}]},
-        {"role": "assistant", "content": "REASONING: ...\nLABEL: SAFE"}
-      ],
-      "image_path": "dataset/Kontent/class_1/126.jpg"
-    },
-    ...
-  ]
 
 Usage:
   python 01_prepare_dataset.py
-  python 01_prepare_dataset.py --config config.yaml --verify
+  python 01_prepare_dataset.py --config config/config_base.yaml --verify
 """
 
 import argparse
@@ -57,15 +44,12 @@ def parse_image_name(
     (KEEP full filename, only use prefix to find folder)
     """
     name = Path(image_name).name
-
     parts = name.split("_", 1)
     if len(parts) != 2:
         return None
 
-    class_idx_str = parts[0]
-
     try:
-        class_idx = int(class_idx_str)
+        class_idx = int(parts[0])
     except ValueError:
         return None
 
@@ -73,16 +57,10 @@ def parse_image_name(
     if folder_name is None:
         return None
 
-    # ✅ KEEP FULL NAME
     return image_root / folder_name / name
 
 
 def build_messages(row: pd.Series, system_prompt: str) -> dict:
-    """
-    Build the chat messages list for one sample.
-    The user turn contains an image placeholder + instruction text.
-    The assistant turn is the expected model output.
-    """
     label = str(row["CLASSIFICATION"]).strip().upper()
     reasoning = str(row["REASONING"]).strip()
 
@@ -116,7 +94,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Prepare dataset for QLoRA fine-tuning"
     )
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--config", default="config/config_base.yaml"
+    )  # ← base config only
     parser.add_argument(
         "--verify",
         action="store_true",
@@ -126,7 +106,7 @@ def main():
 
     cfg = load_config(args.config)
     ds_cfg = cfg["dataset"]
-    system_prompt: str = cfg["prompt"]["system"].strip()
+    system_prompt = cfg["prompt"]["system"].strip()
 
     metadata_csv = Path(ds_cfg["metadata_csv"])
     image_root = Path(ds_cfg["image_root"])
@@ -134,7 +114,7 @@ def main():
     val_json = Path(ds_cfg["val_json"])
     val_split = float(ds_cfg["val_split"])
     seed = int(ds_cfg["seed"])
-    class_folders: dict = {int(k): v for k, v in ds_cfg["class_folders"].items()}
+    class_folders = {int(k): v for k, v in ds_cfg["class_folders"].items()}
 
     # ── Load CSV ────────────────────────────────────────────────────────────
     if not metadata_csv.exists():
@@ -151,7 +131,6 @@ def main():
         print(f"        Found columns: {list(df.columns)}")
         sys.exit(1)
 
-    # Drop rows with missing critical fields
     before = len(df)
     df = df.dropna(subset=["image_name", "CLASSIFICATION", "REASONING"])
     if len(df) < before:
@@ -198,7 +177,7 @@ def main():
         records,
         test_size=val_split,
         random_state=seed,
-        stratify=labels,  # keep label ratio in both splits
+        stratify=labels,
     )
     print(f"\nTrain: {len(train_records)}  |  Val: {len(val_records)}")
 
