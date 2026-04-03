@@ -59,3 +59,22 @@ eval:
   results_dir:    "output/eval_results/trl"
   bertscore_lang: "id"
   manual_eval_n:  50
+
+# ── Debug ─────────────────────────────────────────────────────
+debug:
+  enabled: false         # set true or pass debug=on at CLI
+  n_samples: 2           # how many samples to show in debug output
+  show_raw: true         # show raw HF dataset sample
+  show_tokenized: true   # show token count per sample
+  show_gpu: true         # show GPU memory stats before training
+
+# ── Smoke Test ────────────────────────────────────────────────
+# Quick end-to-end run to verify full pipeline (load → train → save)
+# Activated by: python train_trl.py debug=on
+smoke_test:
+  max_samples: 32        # use only N train + N val samples
+  num_train_epochs: 1    # just 1 epoch
+  max_steps: 4           # stop after 4 optimizer steps
+  save_steps: 2          # save checkpoint early
+  eval_steps: 2          # eval early
+  logging_steps: 1       # log every step

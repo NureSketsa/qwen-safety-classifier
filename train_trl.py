@@ -7,8 +7,9 @@ Supports images via the processor's chat template.
 Environment: Kaggle / Colab / Local (requires ~6GB VRAM)
 
 Usage:
-  python train_trl.py
-  python train_trl.py --config config/config_trl.yaml --base_config config/config_base.yaml --resume
+  python train_trl.py                  ← full training, debug off
+  python train_trl.py debug=on         ← smoke test + verbose debug
+  python train_trl.py --resume         ← resume full training
 """
 
 import argparse
@@ -29,7 +30,8 @@ from transformers import (
     Trainer,
 )
 
-# ── Config ──────────────────────────────────────────────────────────────────
+
+# ── Config ───────────────────────────────────────────────────────────────────
 
 
 def load_config(path: str) -> dict:
@@ -46,6 +48,97 @@ def merge_configs(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+# ── Debug helpers ─────────────────────────────────────────────────────────────
+
+
+def dbg_sep(title: str):
+    width = 60
+    print(f"\n{'=' * width}")
+    print(f"  {title}")
+    print(f"{'=' * width}")
+
+
+def debug_raw_sample(sample, idx: int, dbg: dict):
+    """Show raw HF dataset row (messages stored as JSON string)."""
+    if not (dbg.get("enabled") and dbg.get("show_raw")):
+        return
+    dbg_sep(f"RAW SAMPLE [{idx}]  (HF dataset row)")
+    print(f"  image_path : {sample.get('image_path')}")
+    print(f"  label      : {sample.get('label')}")
+    messages = json.loads(sample["messages_json"])
+    print("  messages   :")
+    for i, m in enumerate(messages):
+        content = m["content"]
+        print(f"    [{i}] role={m['role']}")
+        if isinstance(content, list):
+            for block in content:
+                btype = block.get("type")
+                if btype == "image":
+                    print(f"         [image block]")
+                elif btype == "text":
+                    preview = block.get("text", "")[:120].replace("\n", "↵")
+                    print(f"         [text] {preview!r}")
+        else:
+            preview = str(content)[:120].replace("\n", "↵")
+            print(f"         {preview!r}{'...' if len(str(content)) > 120 else ''}")
+
+
+def debug_tokenized_sample(sample, idx: int, processor, max_seq_length: int, dbg: dict):
+    """Show token count and whether the sample fits in context."""
+    if not (dbg.get("enabled") and dbg.get("show_tokenized")):
+        return
+    dbg_sep(f"TOKENIZED SAMPLE [{idx}]")
+    try:
+        messages = json.loads(sample["messages_json"])
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        ids = processor.tokenizer(text, truncation=False)["input_ids"]
+        fits = len(ids) <= max_seq_length
+        print(f"  token count  : {len(ids)}")
+        print(f"  max_seq_len  : {max_seq_length}")
+        print(f"  fits context : {'✓ YES' if fits else '✗ NO — will be truncated'}")
+        print(f"  prompt preview (first 200 chars):")
+        print(f"    {text[:200].replace(chr(10), '↵')!r}")
+    except Exception as e:
+        print(f"  [WARN] tokenization failed: {e}")
+
+
+def debug_label_distribution(dataset, dbg: dict):
+    """Show SAFE/UNSAFE counts."""
+    if not dbg.get("enabled"):
+        return
+    dbg_sep("LABEL DISTRIBUTION")
+    from collections import Counter
+
+    labels = [s.get("label", "UNKNOWN") for s in dataset]
+    counts = Counter(labels)
+    total = len(labels)
+    for lbl, cnt in sorted(counts.items()):
+        print(f"  {lbl:<10} {cnt:>6}  ({cnt / total * 100:.1f}%)")
+
+
+def debug_gpu(dbg: dict):
+    """Show per-GPU memory stats."""
+    if not (dbg.get("enabled") and dbg.get("show_gpu")):
+        return
+    dbg_sep("GPU MEMORY")
+    if not torch.cuda.is_available():
+        print("  No CUDA device found.")
+        return
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        total = props.total_memory / 1024**3
+        reserved = torch.cuda.memory_reserved(i) / 1024**3
+        allocated = torch.cuda.memory_allocated(i) / 1024**3
+        free = total - reserved
+        print(f"  GPU {i}: {props.name}")
+        print(f"    Total     : {total:.2f} GB")
+        print(f"    Reserved  : {reserved:.2f} GB")
+        print(f"    Allocated : {allocated:.2f} GB")
+        print(f"    Free      : {free:.2f} GB")
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
@@ -88,11 +181,9 @@ class VLMDataCollator:
             except Exception as e:
                 print(f"[WARN] Cannot load image {img_path}: {e}")
                 image = Image.new("RGB", (224, 224), color=(128, 128, 128))
-
             images.append(image)
 
             messages = json.loads(sample["messages_json"])
-
             text = self.processor.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -108,15 +199,13 @@ class VLMDataCollator:
             truncation=True,
             max_length=self.max_seq_length,
         )
-
         labels = encoding["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
         encoding["labels"] = labels
-
         return encoding
 
 
-# ── Model Setup ──────────────────────────────────────────────────────────────
+# ── Model ────────────────────────────────────────────────────────────────────
 
 
 def load_model_and_processor(cfg: dict):
@@ -138,8 +227,6 @@ def load_model_and_processor(cfg: dict):
         trust_remote_code=True,
     )
 
-    model.model.visual = model.model.visual.to(torch.float16)
-
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -151,11 +238,8 @@ def load_model_and_processor(cfg: dict):
             print(f"  Cast {attr} to float16")
             break
 
-    import types
-
     visual_module = model.model.visual
     visual_cls = type(visual_module)
-
     if not getattr(visual_cls, "_dtype_patched", False):
 
         def _patched_dtype(self):
@@ -173,7 +257,6 @@ def load_model_and_processor(cfg: dict):
 def apply_lora(model, cfg: dict):
     lora_cfg = cfg["lora"]
     model = prepare_model_for_kbit_training(model)
-
     lora_config = LoraConfig(
         r=lora_cfg["r"],
         lora_alpha=lora_cfg["alpha"],
@@ -182,13 +265,12 @@ def apply_lora(model, cfg: dict):
         bias=lora_cfg["bias"],
         task_type=TaskType.CAUSAL_LM,
     )
-
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     return model
 
 
-# ── Training ─────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main():
@@ -197,42 +279,122 @@ def main():
     parser = argparse.ArgumentParser(description="Train with TRL SFTTrainer")
     parser.add_argument("--config", default="config/config_trl.yaml")
     parser.add_argument("--base_config", default="config/config_base.yaml")
-    parser.add_argument(
-        "--resume", action="store_true", help="Resume from last checkpoint"
-    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("extra", nargs="*", help="Extra flags e.g. debug=on")
     args = parser.parse_args()
 
-    # Load and merge: base first, then trl overrides
+    # Parse extra flags:  debug=on / debug=off
+    extra_flags = {k: v for k, v in (f.split("=", 1) for f in args.extra if "=" in f)}
+    cli_debug = extra_flags.get("debug", "").lower()
+
+    # ── Load and merge configs
     base_cfg = load_config(args.base_config)
     trl_cfg = load_config(args.config)
     cfg = merge_configs(base_cfg, trl_cfg)
 
     train_cfg = cfg["training"]
     ds_cfg = cfg["dataset"]
+    smoke_cfg = cfg.get("smoke_test", {})
+
+    # CLI flag overrides config file
+    dbg = cfg.get("debug", {"enabled": False})
+    if cli_debug == "on":
+        dbg["enabled"] = True
+    elif cli_debug == "off":
+        dbg["enabled"] = False
+
+    smoke_mode = dbg.get("enabled", False)
+
+    if smoke_mode:
+        print("\n" + "=" * 60)
+        print("  SMOKE TEST / DEBUG MODE ON")
+        print("  Running minimal steps to verify full pipeline.")
+        print("  To disable: python train_trl.py  (no flag)")
+        print("=" * 60)
+    else:
+        print("\n[DEBUG OFF] Full training run. Pass debug=on to enable smoke test.")
 
     # ── Load data
-    print("Loading datasets ...")
+    print("\nLoading datasets ...")
     train_records = load_json_dataset(ds_cfg["train_json"])
     val_records = load_json_dataset(ds_cfg["val_json"])
+
+    if smoke_mode:
+        n = smoke_cfg.get("max_samples", 32)
+        train_records = train_records[:n]
+        val_records = val_records[:n]
+        print(f"  [SMOKE] Using {n} train + {n} val samples")
+
     print(f"  Train: {len(train_records)}  |  Val: {len(val_records)}")
 
     train_dataset = make_hf_dataset(train_records)
     val_dataset = make_hf_dataset(val_records)
 
+    # ── Debug: raw samples
+    n_dbg = dbg.get("n_samples", 2)
+    for i in range(min(n_dbg, len(train_dataset))):
+        debug_raw_sample(train_dataset[i], idx=i, dbg=dbg)
+
+    # ── Debug: label distribution
+    debug_label_distribution(train_records, dbg=dbg)
+
     # ── Load model
     model, processor = load_model_and_processor(cfg)
     model = apply_lora(model, cfg)
 
-    # ── Collator
-    collator = VLMDataCollator(processor, max_seq_length=cfg["model"]["max_seq_length"])
+    # ── Debug: tokenized samples (needs processor)
+    max_seq = cfg["model"]["max_seq_length"]
+    for i in range(min(n_dbg, len(train_dataset))):
+        debug_tokenized_sample(
+            train_dataset[i],
+            idx=i,
+            processor=processor,
+            max_seq_length=max_seq,
+            dbg=dbg,
+        )
 
-    # ── TrainingArguments
-    output_dir = train_cfg["output_dir"]  # ← was output_dir_trl
+    # ── Debug: GPU memory
+    debug_gpu(dbg=dbg)
+
+    # ── Collator
+    collator = VLMDataCollator(processor, max_seq_length=max_seq)
+
+    # ── TrainingArguments — smoke overrides applied here
+    output_dir = train_cfg["output_dir"]
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    num_epochs = (
+        smoke_cfg.get("num_train_epochs", train_cfg["num_train_epochs"])
+        if smoke_mode
+        else train_cfg["num_train_epochs"]
+    )
+    max_steps = smoke_cfg.get("max_steps", -1) if smoke_mode else -1
+    save_steps = (
+        smoke_cfg.get("save_steps", train_cfg["save_steps"])
+        if smoke_mode
+        else train_cfg["save_steps"]
+    )
+    eval_steps = (
+        smoke_cfg.get("eval_steps", train_cfg["eval_steps"])
+        if smoke_mode
+        else train_cfg["eval_steps"]
+    )
+    logging_steps = (
+        smoke_cfg.get("logging_steps", train_cfg["logging_steps"])
+        if smoke_mode
+        else train_cfg["logging_steps"]
+    )
+
+    if smoke_mode:
+        print(
+            f"\n  [SMOKE] epochs={num_epochs}  max_steps={max_steps}"
+            f"  save_steps={save_steps}  eval_steps={eval_steps}"
+        )
 
     training_args = TrainingArguments(
         output_dir=output_dir,
-        num_train_epochs=train_cfg["num_train_epochs"],
+        num_train_epochs=num_epochs,
+        max_steps=max_steps,
         per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
         per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
@@ -244,10 +406,10 @@ def main():
         bf16=train_cfg["bf16"],
         fp16=train_cfg["fp16"],
         save_strategy=train_cfg["save_strategy"],
-        save_steps=train_cfg["save_steps"],
+        save_steps=save_steps,
         eval_strategy=train_cfg["eval_strategy"],
-        eval_steps=train_cfg["eval_steps"],
-        logging_steps=train_cfg["logging_steps"],
+        eval_steps=eval_steps,
+        logging_steps=logging_steps,
         load_best_model_at_end=False,
         report_to=train_cfg["report_to"],
         dataloader_num_workers=train_cfg["dataloader_num_workers"],
@@ -276,7 +438,15 @@ def main():
     trainer.model.save_pretrained(final_path)
     processor.save_pretrained(final_path)
     print(f"\n✓ Adapter saved: {final_path}")
-    print("  Next: run eval.py  or  merge with merge_trl.py")
+
+    if smoke_mode:
+        print("\n" + "=" * 60)
+        print("  ✓ SMOKE TEST PASSED — full pipeline completed.")
+        print("  Verified: load → train → save adapter")
+        print("  Run without debug=on for full training.")
+        print("=" * 60)
+    else:
+        print("  Next: run eval.py  or  merge with merge_trl.py")
 
 
 if __name__ == "__main__":
