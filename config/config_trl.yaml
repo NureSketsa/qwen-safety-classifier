@@ -48,7 +48,7 @@ training:
   metric_for_best_model: "eval_f1"
   greater_is_better: true
   report_to: "none"
-  dataloader_num_workers: 2
+  dataloader_num_workers: 0
 
 # ── Merge / Export ───────────────────────────────────────────
 merge:

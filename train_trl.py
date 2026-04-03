@@ -15,6 +15,8 @@ Usage:
 import argparse
 import json
 import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from pathlib import Path
 
 import torch
@@ -222,7 +224,7 @@ def load_model_and_processor(cfg: dict):
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         model_name,
         quantization_config=bnb_config,
-        device_map={"": 0},
+        device_map="cuda:0",
         torch_dtype=torch.float16,
         trust_remote_code=True,
     )
@@ -417,6 +419,7 @@ def main():
         dataloader_pin_memory=False,
         local_rank=-1,
         ddp_find_unused_parameters=False,
+        no_cuda=False,
     )
 
     # ── Trainer
