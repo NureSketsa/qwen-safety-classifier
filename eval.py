@@ -51,47 +51,42 @@ def merge_configs(base: dict, override: dict) -> dict:
 
 
 def load_model(checkpoint: str, merged: bool, cfg: dict):
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-    from peft import PeftModel
+    """
+    Load model for inference using the same Unsloth loader used during
+    training — guarantees architecture match and avoids the
+    Qwen2_5_VL vs Qwen3_5 mismatch error.
+    """
+    from unsloth import FastLanguageModel, FastVisionModel
+    from transformers import AutoProcessor
 
     model_name = cfg["model"]["name"]
+    max_seq_len = cfg["model"]["max_seq_length"]
 
     if merged:
         print(f"Loading merged model from: {checkpoint}")
-        from transformers import BitsAndBytesConfig
-
-        bnb = BitsAndBytesConfig(
+        model, _ = FastLanguageModel.from_pretrained(
+            model_name=checkpoint,
+            max_seq_length=max_seq_len,
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            checkpoint,
-            quantization_config=bnb,
-            device_map="auto",
-            trust_remote_code=True,
+            dtype=None,
         )
         processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
     else:
-        print(f"Loading base model: {model_name}")
-        print(f"Loading adapter:    {checkpoint}")
-        from transformers import BitsAndBytesConfig
-
-        bnb = BitsAndBytesConfig(
+        print(f"Loading base model : {model_name}")
+        print(f"Loading adapter    : {checkpoint}")
+        model, _ = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=max_seq_len,
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            dtype=None,
         )
-        base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
-            quantization_config=bnb,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        model = PeftModel.from_pretrained(base, checkpoint)
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, checkpoint)
         model = model.merge_and_unload()
         processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
 
+    FastVisionModel.for_inference(model)
     model.eval()
     return model, processor
 
