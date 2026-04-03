@@ -3,7 +3,8 @@ from unsloth import FastLanguageModel
 import argparse
 import json
 import os
-os.environ["UNSLOTH_DISABLE_THINKING"] = "1" 
+
+os.environ["UNSLOTH_DISABLE_THINKING"] = "1"
 from pathlib import Path
 
 import torch
@@ -52,18 +53,23 @@ def make_hf_dataset(records):
             if content is None:
                 content = ""
 
-            fixed_msgs.append({
-                "role": str(role),
-                "content": str(content),  # ✅ ALWAYS STRING
-            })
+            fixed_msgs.append(
+                {
+                    "role": str(role),
+                    "content": str(content),  # ✅ ALWAYS STRING
+                }
+            )
 
-        flat.append({
-            "messages": fixed_msgs,
-            "image_path": str(r["image_path"]),
-            "label": str(r.get("label", "")),
-        })
+        flat.append(
+            {
+                "messages": fixed_msgs,
+                "image_path": str(r["image_path"]),
+                "label": str(r.get("label", "")),
+            }
+        )
 
     return Dataset.from_list(flat)
+
 
 def debug_sample(sample, idx=0):
     print(f"\n===== DEBUG SAMPLE {idx} =====")
@@ -77,8 +83,8 @@ def debug_sample(sample, idx=0):
     print("\nIMAGE PATH:", sample.get("image_path"))
 
     print("=============================\n")
-    
-    
+
+
 def convert_to_conversation(sample, processor):
     try:
         image = Image.open(sample["image_path"]).convert("RGB")
@@ -103,10 +109,7 @@ def convert_to_conversation(sample, processor):
             # convert string → structured
             text = m["content"] if m["content"] is not None else ""
 
-            m["content"] = [
-                {"type": "image"},
-                {"type": "text", "text": text}
-            ]
+            m["content"] = [{"type": "image"}, {"type": "text", "text": text}]
             break
 
     # ✅ VALIDATION (UPDATED FOR STRUCTURED FORMAT)
@@ -116,14 +119,12 @@ def convert_to_conversation(sample, processor):
 
     # must contain image block
     assert any(
-        isinstance(c, dict) and c.get("type") == "image"
-        for c in user_msg["content"]
+        isinstance(c, dict) and c.get("type") == "image" for c in user_msg["content"]
     ), "Missing image block!"
 
     # must contain text block
     assert any(
-        isinstance(c, dict) and c.get("type") == "text"
-        for c in user_msg["content"]
+        isinstance(c, dict) and c.get("type") == "text" for c in user_msg["content"]
     ), "Missing text block!"
 
     # ✅ ensure image loaded
@@ -133,6 +134,7 @@ def convert_to_conversation(sample, processor):
         "messages": messages,
         "images": [image],
     }
+
 
 def load_model_and_processor(cfg: dict):
     model_name = cfg["model"]["name"]
@@ -163,6 +165,7 @@ def load_model_and_processor(cfg: dict):
 
     return model, processor
 
+
 def debug_converted(sample, idx=0):
     print(f"\n===== CONVERTED SAMPLE {idx} =====")
 
@@ -175,7 +178,20 @@ def debug_converted(sample, idx=0):
     print("IMAGE TYPE:", type(sample["images"][0]))
 
     print("=================================\n")
-    
+
+
+def fits_in_context(sample, processor, max_seq_length):
+    """Return True if the sample tokenizes within max_seq_length."""
+    try:
+        text = processor.apply_chat_template(
+            sample["messages"], tokenize=False, add_generation_prompt=False
+        )
+        ids = processor.tokenizer(text, truncation=False)["input_ids"]
+        return len(ids) <= max_seq_length
+    except Exception:
+        return False
+
+
 def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -191,11 +207,11 @@ def main():
     # ── Load data
     print("Loading datasets ...")
     train_records = load_json_dataset(ds_cfg["train_json"])
-    val_records   = load_json_dataset(ds_cfg["val_json"])
+    val_records = load_json_dataset(ds_cfg["val_json"])
     print(f"  Train: {len(train_records)}  |  Val: {len(val_records)}")
 
     train_dataset = make_hf_dataset(train_records)
-    val_dataset   = make_hf_dataset(val_records)
+    val_dataset = make_hf_dataset(val_records)
 
     # ── Load model
     model, processor = load_model_and_processor(cfg)
@@ -206,7 +222,7 @@ def main():
     # ── Convert datasets to {messages, images} format
     train_dataset = [convert_to_conversation(s, processor) for s in train_dataset]
     debug_converted(train_dataset[0])
-    val_dataset   = [convert_to_conversation(s, processor) for s in val_dataset]
+    val_dataset = [convert_to_conversation(s, processor) for s in val_dataset]
 
     # ── Data collator — this is the key difference from your old version
     data_collator = UnslothVisionDataCollator(
@@ -233,7 +249,7 @@ def main():
         lr_scheduler_type=train_cfg["lr_scheduler_type"],
         warmup_steps=train_cfg["warmup_steps"],
         weight_decay=train_cfg["weight_decay"],
-        optim="adamw_8bit",       # ← Unsloth's optimized optimizer
+        optim="adamw_8bit",  # ← Unsloth's optimized optimizer
         bf16=use_bf16,
         fp16=not use_bf16,
         save_strategy=train_cfg["save_strategy"],
@@ -251,18 +267,26 @@ def main():
         max_seq_length=cfg["model"]["max_seq_length"],
         seed=ds_cfg["seed"],
     )
-    
+
     debug_sample(train_dataset[0])
+    max_len = cfg["model"]["max_seq_length"]
+    before = len(train_dataset)
+    train_dataset = [s for s in train_dataset if fits_in_context(s, processor, max_len)]
+    val_dataset = [s for s in val_dataset if fits_in_context(s, processor, max_len)]
+    print(
+        f"Filtered: {before} → {len(train_dataset)} train samples fit in {max_len} tokens"
+    )
 
     # ── SFTTrainer
     import inspect
+
     trainer_params = inspect.signature(SFTTrainer).parameters
     trainer_kwargs = {
-        "model":          model,
-        "args":           sft_config,
-        "train_dataset":  train_dataset,
-        "eval_dataset":   val_dataset,
-        "data_collator":  data_collator,
+        "model": model,
+        "args": sft_config,
+        "train_dataset": train_dataset,
+        "eval_dataset": val_dataset,
+        "data_collator": data_collator,
     }
     # TRL 0.12+ renamed tokenizer → processing_class
     if "processing_class" in trainer_params:
