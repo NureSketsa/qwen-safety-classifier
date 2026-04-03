@@ -176,6 +176,18 @@ def make_hf_dataset(records):
     return Dataset.from_list(flat)
 
 
+def fits_in_context_trl(record, processor_ref, max_len):
+    try:
+        msgs = json.loads(record["messages_json"])
+        text = processor_ref.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+        ids = processor_ref.tokenizer(text, truncation=False)["input_ids"]
+        return len(ids) <= max_len
+    except Exception:
+        return False
+
+
 # ── Collator ─────────────────────────────────────────────────────────────────
 
 
@@ -210,8 +222,7 @@ class VLMDataCollator:
             images=images,
             return_tensors="pt",
             padding=True,
-            truncation=True,
-            max_length=self.max_seq_length,
+            truncation=False,  # ← no truncation; long samples filtered beforehand
         )
         labels = encoding["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
@@ -351,6 +362,36 @@ def main():
 
     # ── Debug: label distribution
     debug_label_distribution(train_records, dbg=dbg)
+
+    from transformers import AutoProcessor as _AP
+
+    def fits_in_context_trl(record, processor_ref, max_len):
+        try:
+            msgs = json.loads(record["messages_json"])
+            text = processor_ref.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=False
+            )
+            ids = processor_ref.tokenizer(text, truncation=False)["input_ids"]
+            return len(ids) <= max_len
+        except Exception:
+            return False
+
+    _pre_proc = _AP.from_pretrained(cfg["model"]["name"], trust_remote_code=True)
+    if _pre_proc.tokenizer.pad_token is None:
+        _pre_proc.tokenizer.pad_token = _pre_proc.tokenizer.eos_token
+
+    before = len(train_dataset)
+    train_dataset = train_dataset.filter(
+        lambda s: fits_in_context_trl(s, _pre_proc, cfg["model"]["max_seq_length"])
+    )
+    val_dataset = val_dataset.filter(
+        lambda s: fits_in_context_trl(s, _pre_proc, cfg["model"]["max_seq_length"])
+    )
+    print(
+        f"  After context filter — Train: {len(train_dataset)}  |  Val: {len(val_dataset)}"
+        f"  (removed {before - len(train_dataset)} long samples)"
+    )
+    del _pre_proc
 
     # ── Load model
     model, processor = load_model_and_processor(cfg)
