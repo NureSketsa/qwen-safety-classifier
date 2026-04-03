@@ -7,9 +7,9 @@ Supports images via the processor's chat template.
 Environment: Kaggle / Colab / Local (requires ~6GB VRAM)
 
 Usage:
-  python train_trl.py                  ← full training, debug off
-  python train_trl.py debug=on         ← smoke test + verbose debug
-  python train_trl.py --resume         ← resume full training
+  python train/train_trl.py                  ← full training, debug off
+  python train/train_trl.py debug=on         ← smoke test + verbose debug
+  python train/train_trl.py --resume         ← resume full training
 """
 
 import argparse
@@ -18,6 +18,10 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from pathlib import Path
+
+# ── Project root resolution ───────────────────────────────────────────────────
+# This file lives at <ROOT>/train/train_trl.py → ROOT is two levels up
+ROOT = Path(__file__).resolve().parent.parent
 
 import torch
 import yaml
@@ -37,7 +41,7 @@ from transformers import (
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(ROOT / path) as f:
         return yaml.safe_load(f)
 
 
@@ -50,6 +54,14 @@ def merge_configs(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+def resolve(path: str) -> Path:
+    """Resolve a config path string relative to project ROOT."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return ROOT / p
 
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
@@ -146,8 +158,8 @@ def debug_gpu(dbg: dict):
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
 
-def load_json_dataset(json_path: str) -> list[dict]:
-    with open(json_path, encoding="utf-8") as f:
+def load_json_dataset(json_path) -> list[dict]:
+    with open(resolve(json_path), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -311,7 +323,7 @@ def main():
         print("\n" + "=" * 60)
         print("  SMOKE TEST / DEBUG MODE ON")
         print("  Running minimal steps to verify full pipeline.")
-        print("  To disable: python train_trl.py  (no flag)")
+        print("  To disable: python train/train_trl.py  (no flag)")
         print("=" * 60)
     else:
         print("\n[DEBUG OFF] Full training run. Pass debug=on to enable smoke test.")
@@ -362,7 +374,7 @@ def main():
     collator = VLMDataCollator(processor, max_seq_length=max_seq)
 
     # ── TrainingArguments — smoke overrides applied here
-    output_dir = train_cfg["output_dir"]
+    output_dir = str(resolve(train_cfg["output_dir"]))
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     num_epochs = (
@@ -448,7 +460,7 @@ def main():
         print("  Run without debug=on for full training.")
         print("=" * 60)
     else:
-        print("  Next: run eval.py  or  merge with merge_trl.py")
+        print("  Next: run eval/eval_trl.py  or  merge with merge_trl.py")
 
 
 if __name__ == "__main__":

@@ -13,14 +13,9 @@ Metrics:
   - Confusion matrix
 
 Usage:
-  # adapter (non-merged)
-  python eval_trl.py --checkpoint output/trl_checkpoint/final_adapter --config config/config_trl.yaml
-
-  # merged model
-  python eval_trl.py --checkpoint output/trl_merged --merged --config config/config_trl.yaml
-
-  # limit samples
-  python eval_trl.py --checkpoint output/trl_checkpoint/final_adapter --n 50
+  python eval/eval_trl.py --checkpoint output/trl_checkpoint/final_adapter --config config/config_trl.yaml
+  python eval/eval_trl.py --checkpoint output/trl_merged --merged --config config/config_trl.yaml
+  python eval/eval_trl.py --checkpoint output/trl_checkpoint/final_adapter --n 50
 """
 
 import os
@@ -31,6 +26,10 @@ import argparse
 import json
 import re
 from pathlib import Path
+
+# ── Project root resolution ───────────────────────────────────────────────────
+# This file lives at <ROOT>/eval/eval_trl.py → ROOT is two levels up
+ROOT = Path(__file__).resolve().parent.parent
 
 import torch
 import yaml
@@ -47,7 +46,7 @@ from transformers import (
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(ROOT / path) as f:
         return yaml.safe_load(f)
 
 
@@ -61,15 +60,18 @@ def merge_configs(base: dict, override: dict) -> dict:
     return result
 
 
+def resolve(path: str) -> Path:
+    """Resolve a config path string relative to project ROOT."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return ROOT / p
+
+
 # ── Model loader ─────────────────────────────────────────────────────────────
 
 
 def load_model(checkpoint: str, merged: bool, cfg: dict):
-    """
-    Load model for inference using plain HuggingFace transformers + PEFT.
-    - merged=False : loads base model + LoRA adapter (no merge)
-    - merged=True  : loads already-merged model directory
-    """
     model_name = cfg["model"]["name"]
 
     bnb_config = BitsAndBytesConfig(
@@ -79,20 +81,25 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
         bnb_4bit_use_double_quant=True,
     )
 
+    # Checkpoint path is resolved relative to ROOT
+    checkpoint_path = str(resolve(checkpoint))
+
     if merged:
-        print(f"Loading merged model from : {checkpoint}")
+        print(f"Loading merged model from : {checkpoint_path}")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            checkpoint,
+            checkpoint_path,
             quantization_config=bnb_config,
             device_map="cuda:0",
             torch_dtype=torch.float16,
             trust_remote_code=True,
         )
-        processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            checkpoint_path, trust_remote_code=True
+        )
 
     else:
         print(f"Loading base model  : {model_name}")
-        print(f"Loading adapter     : {checkpoint}")
+        print(f"Loading adapter     : {checkpoint_path}")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_name,
             quantization_config=bnb_config,
@@ -102,9 +109,10 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
         )
         from peft import PeftModel
 
-        model = PeftModel.from_pretrained(model, checkpoint)
-        # Keep adapter attached (no merge) — saves memory, same results
-        processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+        model = PeftModel.from_pretrained(model, checkpoint_path)
+        processor = AutoProcessor.from_pretrained(
+            checkpoint_path, trust_remote_code=True
+        )
 
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -127,7 +135,6 @@ def run_inference(model, processor, sample: dict, max_new_tokens: int = 256) -> 
         print(f"[WARN] Cannot load {img_path}: {e}")
         image = Image.new("RGB", (224, 224), (128, 128, 128))
 
-    # Strip assistant turn — only prompt
     prompt_messages = [m for m in messages if m["role"] != "assistant"]
 
     text = processor.apply_chat_template(
@@ -258,14 +265,10 @@ def main():
     parser.add_argument(
         "--checkpoint",
         required=True,
-        help="Path to final_adapter dir or merged model dir",
+        help="Path to final_adapter dir or merged model dir (relative to project root)",
     )
     parser.add_argument("--config", default="config/config_trl.yaml")
-    parser.add_argument(
-        "--base_config",
-        default="config/config_base.yaml",
-        help="Optional base config to merge from",
-    )
+    parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument(
         "--merged",
         action="store_true",
@@ -277,7 +280,7 @@ def main():
 
     # ── Load config
     cfg = load_config(args.config)
-    if Path(args.base_config).exists():
+    if (ROOT / args.base_config).exists():
         base_cfg = load_config(args.base_config)
         cfg = merge_configs(base_cfg, cfg)
     cfg_global = cfg
@@ -286,7 +289,9 @@ def main():
     ev_cfg = cfg["eval"]
 
     # ── Load dataset split
-    split_path = ds_cfg["val_json"] if args.split == "val" else ds_cfg["train_json"]
+    split_path = resolve(
+        ds_cfg["val_json"] if args.split == "val" else ds_cfg["train_json"]
+    )
     print(f"Loading {args.split} set: {split_path}")
     with open(split_path, encoding="utf-8") as f:
         records = json.load(f)
@@ -310,7 +315,6 @@ def main():
     for sample in tqdm(records, desc="Inference"):
         gt_label = sample.get("label", "UNKNOWN").upper()
 
-        # Extract ground-truth reasoning from assistant turn
         gt_reasoning = ""
         for msg in sample["messages"]:
             if msg["role"] == "assistant":
@@ -347,14 +351,10 @@ def main():
         f"Confusion matrix :\n  [[TN, FP]\n   [FN, TP]] = {cls_metrics['confusion_matrix']}"
     )
 
-    # ── Unknown label report
     n_unknown = y_pred_labels.count("UNKNOWN")
     if n_unknown:
         print(
             f"\n[WARN] {n_unknown}/{len(y_pred_labels)} predictions had no parseable LABEL."
-        )
-        print(
-            "       Check model output format — expected: LABEL: SAFE or LABEL: UNSAFE"
         )
 
     # ── BERTScore
@@ -370,10 +370,10 @@ def main():
         print(f"BERTScore F1        : {bs_metrics['bertscore_f1']:.4f}")
 
     # ── Save results
-    results_dir = Path(ev_cfg["results_dir"]) / "trl"
+    results_dir = resolve(ev_cfg["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_tag = Path(args.checkpoint).name  # e.g. "final_adapter" or "trl_merged"
+    ckpt_tag = Path(args.checkpoint).name
     out_path = results_dir / f"eval_{ckpt_tag}_{args.split}.json"
 
     results = {

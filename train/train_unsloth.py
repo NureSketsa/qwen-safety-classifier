@@ -7,6 +7,10 @@ import os
 os.environ["UNSLOTH_DISABLE_THINKING"] = "1"
 from pathlib import Path
 
+# ── Project root resolution ───────────────────────────────────────────────────
+# This file lives at <ROOT>/train/train_unsloth.py → ROOT is two levels up
+ROOT = Path(__file__).resolve().parent.parent
+
 import torch
 import yaml
 from datasets import Dataset
@@ -22,8 +26,8 @@ train_unsloth.py
 Fine-tune Qwen3.5-0.8B with Unsloth (~3GB VRAM, 2-2.7x faster).
 
 Usage:
-  python train_unsloth.py
-  python train_unsloth.py --config config/config_unsloth.yaml --base_config config/config_base.yaml --resume
+  python train/train_unsloth.py
+  python train/train_unsloth.py --config config/config_unsloth.yaml --base_config config/config_base.yaml --resume
 
 Debug on/off: set debug.enabled in config/config_unsloth.yaml
 """
@@ -33,7 +37,7 @@ Debug on/off: set debug.enabled in config/config_unsloth.yaml
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(ROOT / path) as f:
         return yaml.safe_load(f)
 
 
@@ -46,6 +50,14 @@ def merge_configs(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+def resolve(path: str) -> Path:
+    """Resolve a config path string relative to project ROOT."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return ROOT / p
 
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
@@ -149,15 +161,13 @@ def debug_label_distribution(dataset, dbg: dict):
         return
     dbg_sep("LABEL DISTRIBUTION")
     from collections import Counter
+    import re
 
-    # dataset here is list of {messages, images} — get label from assistant turn
     labels = []
     for s in dataset:
         for m in s["messages"]:
             if m["role"] == "assistant":
                 content = m["content"] if isinstance(m["content"], str) else ""
-                import re
-
                 match = re.search(r"LABEL\s*:\s*(SAFE|UNSAFE)", content, re.IGNORECASE)
                 labels.append(match.group(1).upper() if match else "UNKNOWN")
                 break
@@ -182,8 +192,8 @@ def debug_filter_summary(before: int, after: int, max_len: int, dbg: dict):
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
 
-def load_json_dataset(json_path: str) -> list[dict]:
-    with open(json_path, encoding="utf-8") as f:
+def load_json_dataset(json_path) -> list[dict]:
+    with open(resolve(json_path), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -316,13 +326,12 @@ def main():
     parser.add_argument("--config", default="config/config_unsloth.yaml")
     parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument("--resume", action="store_true")
-    # Allow bare positional flag:  python train_unsloth.py debug=on
     parser.add_argument("extra", nargs="*", help="Extra flags e.g. debug=on")
     args = parser.parse_args()
 
     # Parse extra flags like debug=on / debug=off
     extra_flags = {k: v for k, v in (f.split("=", 1) for f in args.extra if "=" in f)}
-    cli_debug = extra_flags.get("debug", "").lower()  # "on" / "off" / ""
+    cli_debug = extra_flags.get("debug", "").lower()
 
     # ── Load and merge configs
     base_cfg = load_config(args.base_config)
@@ -340,14 +349,13 @@ def main():
     elif cli_debug == "off":
         dbg["enabled"] = False
 
-    # smoke test = debug=on
     smoke_mode = dbg.get("enabled", False)
 
     if smoke_mode:
         print("\n" + "=" * 60)
         print("  SMOKE TEST / DEBUG MODE ON")
         print("  Running minimal steps to verify full pipeline.")
-        print("  To disable: python train_unsloth.py  (no flag)")
+        print("  To disable: python train/train_unsloth.py  (no flag)")
         print("=" * 60)
     else:
         print("\n[DEBUG OFF] Full training run. Pass debug=on to enable smoke test.")
@@ -357,7 +365,6 @@ def main():
     train_records = load_json_dataset(ds_cfg["train_json"])
     val_records = load_json_dataset(ds_cfg["val_json"])
 
-    # Smoke test: slice to tiny subset
     if smoke_mode:
         n = smoke_cfg.get("max_samples", 32)
         train_records = train_records[:n]
@@ -421,12 +428,11 @@ def main():
     )
 
     # ── SFTConfig
-    output_dir = train_cfg["output_dir"]
+    output_dir = str(resolve(train_cfg["output_dir"]))
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     use_bf16 = torch.cuda.is_bf16_supported()
 
-    # Smoke test: override training length params
     num_epochs = (
         smoke_cfg.get("num_train_epochs", train_cfg["num_train_epochs"])
         if smoke_mode
@@ -514,7 +520,7 @@ def main():
     print(f"\n✓ Adapter saved: {final_path}")
 
     # ── Merge to fp16
-    merge_path = Path(cfg["merge"]["merged"])
+    merge_path = resolve(cfg["merge"]["merged"])
     merge_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained_merged(str(merge_path), processor, save_method="merged_16bit")
     print(f"✓ Merged model saved: {merge_path}")

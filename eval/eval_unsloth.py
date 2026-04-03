@@ -1,6 +1,6 @@
 """
-eval.py
-=======
+eval_unsloth.py
+===============
 Evaluate a fine-tuned checkpoint against the validation set.
 
 Metrics computed:
@@ -12,15 +12,19 @@ Metrics computed:
   - Confusion matrix
 
 Usage:
-  python eval.py --checkpoint output/trl_checkpoint/final_adapter --config config/config_trl.yaml
-  python eval.py --checkpoint output/unsloth_merged --merged      --config config/config_unsloth.yaml
-  python eval.py --checkpoint output/trl_checkpoint/final_adapter --n 50  # manual eval subset
+  python eval/eval_unsloth.py --checkpoint output/trl_checkpoint/final_adapter --config config/config_trl.yaml
+  python eval/eval_unsloth.py --checkpoint output/unsloth_merged --merged      --config config/config_unsloth.yaml
+  python eval/eval_unsloth.py --checkpoint output/trl_checkpoint/final_adapter --n 50
 """
 
 import argparse
 import json
 import re
 from pathlib import Path
+
+# ── Project root resolution ───────────────────────────────────────────────────
+# This file lives at <ROOT>/eval/eval_unsloth.py → ROOT is two levels up
+ROOT = Path(__file__).resolve().parent.parent
 
 import torch
 import yaml
@@ -32,7 +36,7 @@ from tqdm import tqdm
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(ROOT / path) as f:
         return yaml.safe_load(f)
 
 
@@ -47,33 +51,39 @@ def merge_configs(base: dict, override: dict) -> dict:
     return result
 
 
+def resolve(path: str) -> Path:
+    """Resolve a config path string relative to project ROOT."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return ROOT / p
+
+
 # ── Inference ────────────────────────────────────────────────────────────────
 
 
 def load_model(checkpoint: str, merged: bool, cfg: dict):
-    """
-    Load model for inference using the same Unsloth loader used during
-    training — guarantees architecture match and avoids the
-    Qwen2_5_VL vs Qwen3_5 mismatch error.
-    """
     from unsloth import FastLanguageModel, FastVisionModel
     from transformers import AutoProcessor
 
     model_name = cfg["model"]["name"]
     max_seq_len = cfg["model"]["max_seq_length"]
+    checkpoint_path = str(resolve(checkpoint))
 
     if merged:
-        print(f"Loading merged model from: {checkpoint}")
+        print(f"Loading merged model from: {checkpoint_path}")
         model, _ = FastLanguageModel.from_pretrained(
-            model_name=checkpoint,
+            model_name=checkpoint_path,
             max_seq_length=max_seq_len,
             load_in_4bit=True,
             dtype=None,
         )
-        processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            checkpoint_path, trust_remote_code=True
+        )
     else:
         print(f"Loading base model : {model_name}")
-        print(f"Loading adapter    : {checkpoint}")
+        print(f"Loading adapter    : {checkpoint_path}")
         model, _ = FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=max_seq_len,
@@ -82,9 +92,11 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
         )
         from peft import PeftModel
 
-        model = PeftModel.from_pretrained(model, checkpoint)
+        model = PeftModel.from_pretrained(model, checkpoint_path)
         model = model.merge_and_unload()
-        processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            checkpoint_path, trust_remote_code=True
+        )
 
     FastVisionModel.for_inference(model)
     model.eval()
@@ -218,7 +230,9 @@ def main():
         description="Evaluate fine-tuned safety classifier"
     )
     parser.add_argument(
-        "--checkpoint", required=True, help="Path to adapter or merged model dir"
+        "--checkpoint",
+        required=True,
+        help="Path to adapter or merged model dir (relative to project root)",
     )
     parser.add_argument("--config", default="config/config_trl.yaml")
     parser.add_argument("--base_config", default="config/config_base.yaml")
@@ -237,8 +251,9 @@ def main():
     ds_cfg = cfg["dataset"]
     ev_cfg = cfg["eval"]
 
-    split_path = ds_cfg["val_json"] if args.split == "val" else ds_cfg["train_json"]
-
+    split_path = resolve(
+        ds_cfg["val_json"] if args.split == "val" else ds_cfg["train_json"]
+    )
     print(f"Loading {args.split} set: {split_path}")
     with open(split_path, encoding="utf-8") as f:
         records = json.load(f)
@@ -308,9 +323,7 @@ def main():
         print(f"BERTScore F1        : {bs_metrics['bertscore_f1']:.4f}")
 
     # ── Save results
-    results_dir = Path(
-        ev_cfg["results_dir"]
-    )  # ← trl → .../trl  |  unsloth → .../unsloth
+    results_dir = resolve(ev_cfg["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results = {
