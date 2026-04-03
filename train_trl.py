@@ -419,7 +419,6 @@ def main():
         dataloader_pin_memory=False,
         local_rank=-1,
         ddp_find_unused_parameters=False,
-        no_cuda=False,
     )
 
     # ── Trainer
