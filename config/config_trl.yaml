@@ -7,7 +7,7 @@
 model:
   name: "Qwen/Qwen3.5-0.8B"
   max_seq_length: 512
-  max_new_tokens: 256
+  max_new_tokens: 128
 
 # ── QLoRA ────────────────────────────────────────────────────
 lora:
@@ -30,13 +30,13 @@ training:
   output_dir: "output/trl_checkpoint"
   num_train_epochs: 3
   per_device_train_batch_size: 1
-  per_device_eval_batch_size: 4
+  per_device_eval_batch_size: 1
   gradient_accumulation_steps: 16
   learning_rate: 2.0e-4
   lr_scheduler_type: "linear"
   warmup_steps: 100
   weight_decay: 0.01
-  optim: "adamw_torch"
+  optim: "adamw_8bit"
   bf16: false
   fp16: true
   save_strategy: "steps"
@@ -62,7 +62,7 @@ eval:
 
 # ── Debug ─────────────────────────────────────────────────────
 debug:
-  enabled: false         # set true or pass debug=on at CLI
+  enabled: true         # set true or pass debug=on at CLI
   n_samples: 2           # how many samples to show in debug output
   show_raw: true         # show raw HF dataset sample
   show_tokenized: true   # show token count per sample
