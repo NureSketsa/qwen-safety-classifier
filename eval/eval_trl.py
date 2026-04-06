@@ -148,8 +148,6 @@ def run_inference(model, processor, sample: dict, max_new_tokens: int = 256) -> 
         images=[image],
         return_tensors="pt",
         padding=True,
-        truncation=True,
-        max_length=cfg_global["model"]["max_seq_length"],
     ).to("cuda:0")
 
     with torch.inference_mode():
