@@ -25,12 +25,20 @@ train_unsloth.py
 ================
 Fine-tune Qwen3.5-0.8B with Unsloth (~3GB VRAM, 2-2.7x faster).
 
+Supports both:
+  - Regular image samples  (.jpg / .png / etc.)
+  - Video tensor samples   (.pt files produced by 00_extract_frames.py)
+    → loads pixel_values_videos + video_grid_thw from the .pt package
+      and injects them into the batch after the collator runs
+
 Usage:
   python train/train_unsloth.py
   python train/train_unsloth.py --config config/config_unsloth.yaml --base_config config/config_base.yaml --resume
 
-Debug on/off: set debug.enabled in config/config_unsloth.yaml
+Debug on/off: set debug.enabled in config/config_unsloth.yaml, or pass debug=on at CLI
 """
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -60,6 +68,34 @@ def resolve(path: str) -> Path:
     return ROOT / p
 
 
+# ── Video helpers ─────────────────────────────────────────────────────────────
+
+
+def is_video_sample(path: str) -> bool:
+    """Return True if the sample is a video .pt tensor package."""
+    return Path(path).suffix.lower() == ".pt"
+
+
+def load_video_pt(path: str) -> dict:
+    """
+    Load a temporal tensor package produced by 00_extract_frames.py.
+
+    Returns dict with:
+      "frames"   : (T, C, H, W) float32 [0, 1]
+      "grid_thw" : (1, 3) long  — (grid_t, grid_h, grid_w)
+    Falls back to a 2-frame dummy on any error so the batch never breaks.
+    """
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        return data
+    except Exception as e:
+        print(f"[WARN] Cannot load video pt {path}: {e}")
+        return {
+            "frames": torch.zeros(2, 3, 224, 224, dtype=torch.float32),
+            "grid_thw": torch.tensor([[1, 16, 16]], dtype=torch.long),
+        }
+
+
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 
 
@@ -77,6 +113,8 @@ def debug_raw_sample(sample, idx: int, dbg: dict):
     dbg_sep(f"RAW SAMPLE [{idx}]  (pre-conversion)")
     print(f"  image_path : {sample.get('image_path')}")
     print(f"  label      : {sample.get('label')}")
+    is_vid = is_video_sample(sample.get("image_path", ""))
+    print(f"  type       : {'VIDEO (.pt)' if is_vid else 'IMAGE'}")
     print("  messages   :")
     for i, m in enumerate(sample["messages"]):
         content = m["content"]
@@ -90,13 +128,21 @@ def debug_raw_sample(sample, idx: int, dbg: dict):
 
 
 def debug_converted_sample(sample, idx: int, dbg: dict):
-    """Show the converted {messages, images} dict."""
+    """Show the converted {messages, images/video_frames} dict."""
     if not (dbg.get("enabled") and dbg.get("show_converted")):
         return
     dbg_sep(f"CONVERTED SAMPLE [{idx}]  (post-conversion)")
-    print(f"  image count : {len(sample['images'])}")
-    img = sample["images"][0]
-    print(f"  image size  : {img.size}  mode={img.mode}")
+    if "images" in sample and sample["images"]:
+        img = sample["images"][0]
+        print(f"  type        : IMAGE")
+        print(f"  image count : {len(sample['images'])}")
+        print(f"  image size  : {img.size}  mode={img.mode}")
+    elif "video_frames" in sample:
+        frames = sample["video_frames"]
+        grid = sample["video_grid_thw"]
+        print(f"  type        : VIDEO (.pt)")
+        print(f"  frames shape: {tuple(frames.shape)}")
+        print(f"  grid_thw    : {grid.tolist()}")
     print("  messages    :")
     for i, m in enumerate(sample["messages"]):
         content = m["content"]
@@ -237,36 +283,67 @@ def make_hf_dataset(records):
 
 
 def convert_to_conversation(sample, processor):
-    try:
-        image = Image.open(sample["image_path"]).convert("RGB")
-    except Exception as e:
-        print(f"[WARN] Cannot load {sample['image_path']}: {e}")
-        image = Image.new("RGB", (224, 224), color=(128, 128, 128))
+    """
+    Convert a flat HF dataset row into the dict expected by the collator.
 
+    For image samples:
+        {"messages": [...], "images": [PIL.Image]}
+
+    For video .pt samples:
+        {"messages": [...], "images": [dummy_PIL], "video_frames": Tensor, "video_grid_thw": Tensor}
+
+    A dummy PIL image is always included so UnslothVisionDataCollator can build
+    the token sequence with the <image> placeholder; the actual pixel values are
+    replaced by the VideoAwareCollator wrapper before the batch reaches the model.
+    """
+    path = sample["image_path"]
     messages = sample["messages"]
 
-    assert any(m["role"] == "user" for m in messages), "No user role!"
-    assert any(m["role"] == "assistant" for m in messages), "No assistant role!"
-
+    # ── Ensure user message has the correct [image, text] structure ──────────
     for m in messages:
         if m["role"] == "user":
-            if isinstance(m["content"], list):
-                break
-            text = m["content"] if m["content"] is not None else ""
-            m["content"] = [{"type": "image"}, {"type": "text", "text": text}]
+            if not isinstance(m["content"], list):
+                text = m["content"] if m["content"] is not None else ""
+                m["content"] = [{"type": "image"}, {"type": "text", "text": text}]
             break
 
+    # Sanity checks
     user_msg = next(m for m in messages if m["role"] == "user")
     assert isinstance(user_msg["content"], list), "User content must be list!"
     assert any(
         isinstance(c, dict) and c.get("type") == "image" for c in user_msg["content"]
-    ), "Missing image block!"
+    ), "Missing image block in user message!"
     assert any(
         isinstance(c, dict) and c.get("type") == "text" for c in user_msg["content"]
-    ), "Missing text block!"
-    assert isinstance(image, Image.Image), "Invalid image!"
+    ), "Missing text block in user message!"
 
-    return {"messages": messages, "images": [image]}
+    if is_video_sample(path):
+        # Load video tensor package
+        vdata = load_video_pt(path)
+        frames = vdata["frames"].to(torch.float32)  # (T, C, H, W)
+        grid_thw = vdata["grid_thw"]  # (1, 3)
+
+        # Provide a dummy image so the tokenizer can insert the <image> token
+        # The VideoAwareCollator will overwrite pixel_values with video tensors.
+        dummy_image = Image.new("RGB", (224, 224), color=(0, 0, 0))
+
+        return {
+            "messages": messages,
+            "images": [dummy_image],
+            "video_frames": frames,
+            "video_grid_thw": grid_thw,
+        }
+    else:
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] Cannot load {path}: {e}")
+            image = Image.new("RGB", (224, 224), color=(128, 128, 128))
+
+        return {
+            "messages": messages,
+            "images": [image],
+        }
 
 
 # ── Context filter ───────────────────────────────────────────────────────────
@@ -281,6 +358,77 @@ def fits_in_context(sample, processor, max_seq_length: int) -> bool:
         return len(ids) <= max_seq_length
     except Exception:
         return False
+
+
+# ── Video-aware collator wrapper ──────────────────────────────────────────────
+
+
+class VideoAwareCollator:
+    """
+    Wraps UnslothVisionDataCollator to transparently handle video .pt samples.
+
+    Strategy:
+      1. Separate the batch into image-only samples and video samples.
+      2. Pass ALL samples through UnslothVisionDataCollator using their
+         dummy PIL images so token IDs, attention mask, and labels are
+         built correctly (the collator sees a standard image placeholder).
+      3. For any video sample, replace the corresponding pixel_values rows
+         with the actual video frames (pixel_values_videos) and inject
+         video_grid_thw so the model routes them through temporal attention.
+
+    If the batch is pure-image, this is a zero-overhead passthrough.
+    If the batch is pure-video or mixed, video tensors are injected post-collation.
+    """
+
+    def __init__(self, base_collator):
+        self.base = base_collator
+
+    def __call__(self, batch: list[dict]) -> dict:
+        # Identify video samples before stripping extra keys
+        video_indices = [i for i, s in enumerate(batch) if "video_frames" in s]
+
+        # Stash video tensors, then remove them so the base collator
+        # only sees {messages, images} — its expected schema.
+        video_frames_list = []
+        video_grids_list = []
+        clean_batch = []
+        for i, sample in enumerate(batch):
+            if "video_frames" in sample:
+                video_frames_list.append(sample["video_frames"])
+                video_grids_list.append(sample["video_grid_thw"])
+                # Build a clean copy with only the keys the base collator needs
+                clean_batch.append(
+                    {
+                        k: v
+                        for k, v in sample.items()
+                        if k not in ("video_frames", "video_grid_thw")
+                    }
+                )
+            else:
+                clean_batch.append(sample)
+
+        # Run the standard Unsloth collator (handles tokenization + labels)
+        encoding = self.base(clean_batch)
+
+        # ── Inject video tensors if any video samples are present ─────────────
+        if video_indices:
+            # pixel_values_videos  : (total_T_all_videos, C, H, W)
+            # video_grid_thw       : (num_videos, 3)
+            pv_videos = torch.cat(
+                [f.to(torch.float32) for f in video_frames_list], dim=0
+            )
+            grid_thw = torch.cat(video_grids_list, dim=0)  # (num_videos, 3)
+
+            encoding["pixel_values_videos"] = pv_videos
+            encoding["video_grid_thw"] = grid_thw
+
+            # If the batch is *pure video*, drop pixel_values to avoid the model
+            # trying to process the dummy image pixels through the image path.
+            if len(video_indices) == len(batch):
+                encoding.pop("pixel_values", None)
+                encoding.pop("image_grid_thw", None)
+
+        return encoding
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -387,7 +535,7 @@ def main():
     # ── Switch to training mode
     FastVisionModel.for_training(model)
 
-    # ── Convert datasets
+    # ── Convert datasets (now video-aware)
     train_dataset = [convert_to_conversation(s, processor) for s in train_dataset]
     val_dataset = [convert_to_conversation(s, processor) for s in val_dataset]
 
@@ -419,13 +567,16 @@ def main():
     debug_gpu(dbg=dbg)
 
     # ── Data collator
-    data_collator = UnslothVisionDataCollator(
+    # Wrap UnslothVisionDataCollator in VideoAwareCollator so video .pt
+    # samples get their temporal tensors injected post-tokenisation.
+    base_collator = UnslothVisionDataCollator(
         model,
         processor,
         train_on_responses_only=True,
         instruction_part="<|im_start|>user\n",
         response_part="<|im_start|>assistant\n",
     )
+    data_collator = VideoAwareCollator(base_collator)
 
     # ── SFTConfig
     output_dir = str(resolve(train_cfg["output_dir"]))

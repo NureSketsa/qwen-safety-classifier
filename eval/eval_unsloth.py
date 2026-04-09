@@ -3,6 +3,11 @@ eval_unsloth.py
 ===============
 Evaluate a fine-tuned checkpoint against the validation set.
 
+Supports both:
+  - Regular image samples  (.jpg / .png / etc.)
+  - Video tensor samples   (.pt files produced by 00_extract_frames.py)
+    → loads pixel_values_videos + video_grid_thw from the .pt package
+
 Metrics computed:
   - F1-Score (macro & binary UNSAFE)
   - Recall for UNSAFE class (priority metric)
@@ -59,6 +64,33 @@ def resolve(path: str) -> Path:
     return ROOT / p
 
 
+# ── Video helpers ─────────────────────────────────────────────────────────────
+
+
+def is_video_sample(path: str) -> bool:
+    """Return True if the sample path points to a video .pt tensor package."""
+    return Path(path).suffix.lower() == ".pt"
+
+
+def load_video_pt(path: str) -> dict:
+    """
+    Load a temporal tensor package produced by 00_extract_frames.py.
+
+    Returns dict with:
+      "frames"   : (T, C, H, W) float32 [0, 1]
+      "grid_thw" : (1, 3) long
+    Falls back to a 2-frame dummy on any error.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as e:
+        print(f"[WARN] Cannot load video pt {path}: {e}")
+        return {
+            "frames": torch.zeros(2, 3, 224, 224, dtype=torch.float32),
+            "grid_thw": torch.tensor([[1, 16, 16]], dtype=torch.long),
+        }
+
+
 # ── Inference ────────────────────────────────────────────────────────────────
 
 
@@ -99,32 +131,66 @@ def load_model(checkpoint: str, merged: bool, cfg: dict):
         )
 
     FastVisionModel.for_inference(model)
+
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
     model.eval()
     return model, processor
 
 
 def run_inference(model, processor, sample: dict, max_new_tokens: int = 512) -> str:
+    """
+    Run inference on a single sample.
+
+    Handles both regular image samples and video .pt tensor samples.
+    For video samples, pixel_values_videos and video_grid_thw are injected
+    directly into the processor inputs after the text is tokenised, mirroring
+    the approach used in eval_trl.py.
+    """
     img_path = sample["image_path"]
-    messages = sample["messages"]
 
-    try:
-        image = Image.open(img_path).convert("RGB")
-    except Exception as e:
-        print(f"[WARN] Cannot load {img_path}: {e}")
-        image = Image.new("RGB", (224, 224), (128, 128, 128))
-
-    prompt_messages = [m for m in messages if m["role"] != "assistant"]
+    # Build prompt (exclude assistant turn)
+    prompt_messages = [m for m in sample["messages"] if m["role"] != "assistant"]
     text = processor.apply_chat_template(
         prompt_messages,
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    inputs = processor(
-        text=[text],
-        images=[image],
-        return_tensors="pt",
-    ).to(model.device)
+    device = next(model.parameters()).device
+
+    if is_video_sample(img_path):
+        # ── Video path ─────────────────────────────────────────────────────
+        vdata = load_video_pt(img_path)
+        frames = vdata["frames"].to(torch.float32)  # (T, C, H, W)
+        grid_thw = vdata["grid_thw"]  # (1, 3)
+
+        # Tokenise text only (no image pixels via processor)
+        inputs = processor(
+            text=[text],
+            return_tensors="pt",
+            padding=True,
+        ).to(device)
+
+        # Inject video tensors directly — the model's temporal attention path
+        # uses pixel_values_videos + video_grid_thw instead of pixel_values.
+        inputs["pixel_values_videos"] = frames.to(device)
+        inputs["video_grid_thw"] = grid_thw.to(device)
+
+    else:
+        # ── Image path ─────────────────────────────────────────────────────
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] Cannot load {img_path}: {e}")
+            image = Image.new("RGB", (224, 224), (128, 128, 128))
+
+        inputs = processor(
+            text=[text],
+            images=[image],
+            return_tensors="pt",
+        ).to(device)
 
     with torch.inference_mode():
         output_ids = model.generate(
@@ -133,6 +199,7 @@ def run_inference(model, processor, sample: dict, max_new_tokens: int = 512) -> 
             do_sample=False,
             temperature=None,
             top_p=None,
+            pad_token_id=processor.tokenizer.pad_token_id,
         )
 
     input_len = inputs["input_ids"].shape[1]
@@ -227,14 +294,14 @@ def compute_bertscore(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate fine-tuned safety classifier"
+        description="Evaluate fine-tuned safety classifier (Unsloth)"
     )
     parser.add_argument(
         "--checkpoint",
         required=True,
         help="Path to adapter or merged model dir (relative to project root)",
     )
-    parser.add_argument("--config", default="config/config_trl.yaml")
+    parser.add_argument("--config", default="config/config_unsloth.yaml")
     parser.add_argument("--base_config", default="config/config_base.yaml")
     parser.add_argument(
         "--merged", action="store_true", help="Checkpoint is a merged model"
@@ -262,15 +329,20 @@ def main():
         records = records[: args.n]
         print(f"Evaluating first {args.n} samples")
 
+    # ── Count video vs image samples
+    n_video = sum(1 for r in records if is_video_sample(r.get("image_path", "")))
+    n_image = len(records) - n_video
+    print(f"  Image samples : {n_image}  |  Video (.pt) samples : {n_video}")
+
     # ── Load model
     model, processor = load_model(args.checkpoint, args.merged, cfg)
     max_new_tokens = cfg["model"]["max_new_tokens"]
 
     # ── Run inference
-    y_true_labels = []
-    y_pred_labels = []
-    pred_reasonings = []
-    ref_reasonings = []
+    y_true_labels: list[str] = []
+    y_pred_labels: list[str] = []
+    pred_reasonings: list[str] = []
+    ref_reasonings: list[str] = []
 
     for sample in tqdm(records, desc="Inference"):
         gt_label = sample.get("label", "UNKNOWN").upper()
@@ -310,6 +382,10 @@ def main():
         f"Confusion matrix :\n  [[TN, FP]\n   [FN, TP]] = {cls_metrics['confusion_matrix']}"
     )
 
+    n_unknown = y_pred_labels.count("UNKNOWN")
+    if n_unknown:
+        print(f"[WARN] {n_unknown}/{len(y_pred_labels)} unparseable predictions.")
+
     # ── BERTScore
     print("\n" + "=" * 60)
     print("BERTSCORE (reasoning quality, Indonesian)")
@@ -330,6 +406,9 @@ def main():
         "checkpoint": args.checkpoint,
         "split": args.split,
         "n_samples": len(records),
+        "n_image_samples": n_image,
+        "n_video_samples": n_video,
+        "n_unknown_preds": n_unknown,
         "classification": {k: v for k, v in cls_metrics.items() if k != "report"},
         "bertscore": bs_metrics,
     }
