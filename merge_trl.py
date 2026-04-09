@@ -1,16 +1,27 @@
+"""
+merge_trl.py
+============
+Merge a LoRA adapter into the base model and save as a standalone model.
+
+Changes vs. original:
+  - Uses AutoModelForImageTextToText (not Qwen3_5ForConditionalGeneration)
+  - Uses torch.float32 for merge (float32 is required for accurate weight addition)
+
+Usage:
+  python merge_trl.py
+  python merge_trl.py --adapter output/trl_checkpoint/final_adapter --output output/trl_merged
+"""
+
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-import torch
-import yaml
 import argparse
 from pathlib import Path
-from transformers import (
-    AutoProcessor,
-    Qwen3_5ForConditionalGeneration,
-    BitsAndBytesConfig,
-)
+
+import torch
+import yaml
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from peft import PeftModel
 
 
@@ -28,11 +39,11 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading base model: {model_name}")
-    # Load in fp16, NO quantization — merging requires real weights
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    print(f"Loading base model (float32): {model_name}")
+    # float32 is required for merge — quantized (int4) weights cannot be merged
+    model = AutoModelForImageTextToText.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map="cuda:0",
         trust_remote_code=True,
     )

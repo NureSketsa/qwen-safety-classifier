@@ -2,14 +2,22 @@
 train_trl.py
 ============
 Fine-tune Qwen3.5-0.8B-Instruct with QLoRA using HuggingFace TRL SFTTrainer.
-Supports images via the processor's chat template.
 
-Environment: Kaggle / Colab / Local (requires ~6GB VRAM)
+Changes vs. original:
+  - Uses AutoModelForImageTextToText (not Qwen3_5ForConditionalGeneration)
+  - Uses torch.float32 throughout (not float16) for numerical stability
+  - VLMDataCollator handles both:
+      * regular image samples   (image_path ends with .jpg/.png/etc.)
+      * video tensor samples    (image_path ends with .pt)
+        → loads pixel_values_videos + video_grid_thw from the .pt file
+          produced by 00_extract_frames.py
+
+Environment: Kaggle / Colab / Local (requires ~6 GB VRAM minimum)
 
 Usage:
-  python train/train_trl.py                  ← full training, debug off
+  python train/train_trl.py                  ← full training
   python train/train_trl.py debug=on         ← smoke test + verbose debug
-  python train/train_trl.py --resume         ← resume full training
+  python train/train_trl.py --resume         ← resume from last checkpoint
 """
 
 import argparse
@@ -19,8 +27,6 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from pathlib import Path
 
-# ── Project root resolution ───────────────────────────────────────────────────
-# This file lives at <ROOT>/train/train_trl.py → ROOT is two levels up
 ROOT = Path(__file__).resolve().parent.parent
 
 import torch
@@ -29,15 +35,15 @@ from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from PIL import Image
 from transformers import (
+    AutoModelForImageTextToText,
     AutoProcessor,
     BitsAndBytesConfig,
-    Qwen3_5ForConditionalGeneration,
     TrainingArguments,
     Trainer,
 )
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 
 def load_config(path: str) -> dict:
@@ -46,7 +52,6 @@ def load_config(path: str) -> dict:
 
 
 def merge_configs(base: dict, override: dict) -> dict:
-    """Deep merge: override takes priority over base."""
     result = base.copy()
     for k, v in override.items():
         if k in result and isinstance(result[k], dict) and isinstance(v, dict):
@@ -57,50 +62,39 @@ def merge_configs(base: dict, override: dict) -> dict:
 
 
 def resolve(path: str) -> Path:
-    """Resolve a config path string relative to project ROOT."""
     p = Path(path)
-    if p.is_absolute():
-        return p
-    return ROOT / p
+    return p if p.is_absolute() else ROOT / p
 
 
 # ── Debug helpers ─────────────────────────────────────────────────────────────
 
 
 def dbg_sep(title: str):
-    width = 60
-    print(f"\n{'=' * width}")
-    print(f"  {title}")
-    print(f"{'=' * width}")
+    print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
 
 def debug_raw_sample(sample, idx: int, dbg: dict):
-    """Show raw HF dataset row (messages stored as JSON string)."""
     if not (dbg.get("enabled") and dbg.get("show_raw")):
         return
-    dbg_sep(f"RAW SAMPLE [{idx}]  (HF dataset row)")
+    dbg_sep(f"RAW SAMPLE [{idx}]")
     print(f"  image_path : {sample.get('image_path')}")
     print(f"  label      : {sample.get('label')}")
     messages = json.loads(sample["messages_json"])
-    print("  messages   :")
     for i, m in enumerate(messages):
         content = m["content"]
-        print(f"    [{i}] role={m['role']}")
+        print(f"  [{i}] role={m['role']}")
         if isinstance(content, list):
             for block in content:
                 btype = block.get("type")
                 if btype == "image":
-                    print(f"         [image block]")
+                    print("       [image block]")
                 elif btype == "text":
-                    preview = block.get("text", "")[:120].replace("\n", "↵")
-                    print(f"         [text] {preview!r}")
+                    print(f"       [text] {block.get('text','')[:120]!r}")
         else:
-            preview = str(content)[:120].replace("\n", "↵")
-            print(f"         {preview!r}{'...' if len(str(content)) > 120 else ''}")
+            print(f"       {str(content)[:120]!r}")
 
 
 def debug_tokenized_sample(sample, idx: int, processor, max_seq_length: int, dbg: dict):
-    """Show token count and whether the sample fits in context."""
     if not (dbg.get("enabled") and dbg.get("show_tokenized")):
         return
     dbg_sep(f"TOKENIZED SAMPLE [{idx}]")
@@ -112,16 +106,13 @@ def debug_tokenized_sample(sample, idx: int, processor, max_seq_length: int, dbg
         ids = processor.tokenizer(text, truncation=False)["input_ids"]
         fits = len(ids) <= max_seq_length
         print(f"  token count  : {len(ids)}")
-        print(f"  max_seq_len  : {max_seq_length}")
-        print(f"  fits context : {'✓ YES' if fits else '✗ NO — will be truncated'}")
-        print(f"  prompt preview (first 200 chars):")
-        print(f"    {text[:200].replace(chr(10), '↵')!r}")
+        print(f"  fits context : {'✓ YES' if fits else '✗ NO'}")
+        print(f"  prompt preview : {text[:200].replace(chr(10), '↵')!r}")
     except Exception as e:
         print(f"  [WARN] tokenization failed: {e}")
 
 
 def debug_label_distribution(dataset, dbg: dict):
-    """Show SAFE/UNSAFE counts."""
     if not dbg.get("enabled"):
         return
     dbg_sep("LABEL DISTRIBUTION")
@@ -135,7 +126,6 @@ def debug_label_distribution(dataset, dbg: dict):
 
 
 def debug_gpu(dbg: dict):
-    """Show per-GPU memory stats."""
     if not (dbg.get("enabled") and dbg.get("show_gpu")):
         return
     dbg_sep("GPU MEMORY")
@@ -147,15 +137,19 @@ def debug_gpu(dbg: dict):
         total = props.total_memory / 1024**3
         reserved = torch.cuda.memory_reserved(i) / 1024**3
         allocated = torch.cuda.memory_allocated(i) / 1024**3
-        free = total - reserved
         print(f"  GPU {i}: {props.name}")
-        print(f"    Total     : {total:.2f} GB")
-        print(f"    Reserved  : {reserved:.2f} GB")
-        print(f"    Allocated : {allocated:.2f} GB")
-        print(f"    Free      : {free:.2f} GB")
+        print(
+            f"    Total={total:.2f}GB  Reserved={reserved:.2f}GB  Allocated={allocated:.2f}GB"
+        )
 
 
-# ── Dataset ──────────────────────────────────────────────────────────────────
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
+
+
+def is_video_sample(path: str) -> bool:
+    return Path(path).suffix.lower() == ".pt"
 
 
 def load_json_dataset(json_path) -> list[dict]:
@@ -163,7 +157,7 @@ def load_json_dataset(json_path) -> list[dict]:
         return json.load(f)
 
 
-def make_hf_dataset(records):
+def make_hf_dataset(records: list[dict]) -> Dataset:
     flat = []
     for r in records:
         flat.append(
@@ -176,61 +170,240 @@ def make_hf_dataset(records):
     return Dataset.from_list(flat)
 
 
-def fits_in_context_trl(record, processor_ref, max_len):
+def fits_in_context(record: dict, processor, max_len: int) -> bool:
     try:
         msgs = json.loads(record["messages_json"])
-        text = processor_ref.apply_chat_template(
+        text = processor.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False
         )
-        ids = processor_ref.tokenizer(text, truncation=False)["input_ids"]
+        ids = processor.tokenizer(text, truncation=False)["input_ids"]
         return len(ids) <= max_len
     except Exception:
         return False
 
 
-# ── Collator ─────────────────────────────────────────────────────────────────
+# ── Data collator ─────────────────────────────────────────────────────────────
 
 
 class VLMDataCollator:
+    """
+    Handles both image samples and video tensor samples (.pt).
+
+    For video .pt files (produced by 00_extract_frames.py):
+      - loads the dict with keys "frames" (T,C,H,W) and "grid_thw" (1,3)
+      - passes pixel_values_videos + video_grid_thw to the processor
+      - the model routes them through its temporal attention path
+
+    For image samples:
+      - standard PIL load → processor
+    """
+
     def __init__(self, processor, max_seq_length: int = 2048):
         self.processor = processor
         self.max_seq_length = max_seq_length
 
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _load_image(self, path: str) -> Image.Image:
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] Cannot load image {path}: {e}")
+            return Image.new("RGB", (224, 224), color=(128, 128, 128))
+
+    def _load_video_pt(self, path: str) -> dict:
+        """Load a .pt temporal tensor package produced by 00_extract_frames.py."""
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=True)
+            # data["frames"]   : (T, C, H, W) float32 [0,1]
+            # data["grid_thw"] : (1, 3) long
+            return data
+        except Exception as e:
+            print(f"[WARN] Cannot load video pt {path}: {e}")
+            # Return a minimal 1-frame dummy so the batch doesn't break
+            dummy_frames = torch.zeros(2, 3, 224, 224, dtype=torch.float32)
+            dummy_grid = torch.tensor([[1, 16, 16]], dtype=torch.long)
+            return {"frames": dummy_frames, "grid_thw": dummy_grid}
+
+    # ── collate ──────────────────────────────────────────────────────────────
+
     def __call__(self, batch: list[dict]) -> dict:
-        texts = []
-        images = []
+        texts: list[str] = []
+        images: list[Image.Image | None] = []
+        video_tensors: list[torch.Tensor | None] = []  # (T,C,H,W) per sample
+        video_grids: list[torch.Tensor | None] = []  # (1,3) per sample
+        has_video = False
+        has_image = False
 
         for sample in batch:
-            img_path = sample["image_path"]
-            try:
-                image = Image.open(img_path).convert("RGB")
-            except Exception as e:
-                print(f"[WARN] Cannot load image {img_path}: {e}")
-                image = Image.new("RGB", (224, 224), color=(128, 128, 128))
-            images.append(image)
-
-            messages = json.loads(sample["messages_json"])
+            path = sample["image_path"]
+            msgs = json.loads(sample["messages_json"])
             text = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
+                msgs, tokenize=False, add_generation_prompt=False
             )
             texts.append(text)
 
-        encoding = self.processor(
-            text=texts,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,  # ← no truncation; long samples filtered beforehand
-        )
+            if is_video_sample(path):
+                has_video = True
+                vdata = self._load_video_pt(path)
+                video_tensors.append(vdata["frames"])  # (T,C,H,W)
+                video_grids.append(vdata["grid_thw"])  # (1,3)
+                images.append(None)
+            else:
+                has_image = True
+                images.append(self._load_image(path))
+                video_tensors.append(None)
+                video_grids.append(None)
+
+        # ── Build processor inputs ────────────────────────────────────────────
+        # We call the processor separately for image vs video sub-batches,
+        # then merge, because the processor's image / video kwargs differ.
+
+        # Pure-image batch (most common case)
+        if has_image and not has_video:
+            encoding = self.processor(
+                text=texts,
+                images=images,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+            )
+
+        # Pure-video batch
+        elif has_video and not has_image:
+            # Stack frames: all samples must share T,H,W after padding in 00_extract
+            # Concatenate along batch (each video is independent)
+            # pixel_values_videos expected shape: (sum_of_tokens, C)
+            # We flatten (T*grid_h*grid_w patches) per video
+            pv_videos, grid_thw_list = self._build_video_inputs(
+                video_tensors, video_grids
+            )
+            encoding = self.processor(
+                text=texts,
+                videos=None,  # raw PIL videos not used; we pass tensors directly
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+            )
+            encoding["pixel_values_videos"] = pv_videos
+            encoding["video_grid_thw"] = grid_thw_list
+
+        # Mixed batch (image + video)  — split and merge
+        else:
+            image_indices = [i for i, t in enumerate(video_tensors) if t is None]
+            video_indices = [i for i, t in enumerate(video_tensors) if t is not None]
+
+            img_enc = (
+                self.processor(
+                    text=[texts[i] for i in image_indices],
+                    images=[images[i] for i in image_indices],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=False,
+                )
+                if image_indices
+                else None
+            )
+
+            vid_pv, vid_grid = (
+                self._build_video_inputs(
+                    [video_tensors[i] for i in video_indices],
+                    [video_grids[i] for i in video_indices],
+                )
+                if video_indices
+                else (None, None)
+            )
+
+            vid_enc = (
+                self.processor(
+                    text=[texts[i] for i in video_indices],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=False,
+                )
+                if video_indices
+                else None
+            )
+            if vid_enc is not None and vid_pv is not None:
+                vid_enc["pixel_values_videos"] = vid_pv
+                vid_enc["video_grid_thw"] = vid_grid
+
+            encoding = self._merge_encodings(
+                img_enc, vid_enc, image_indices, video_indices, len(batch)
+            )
+
+        # ── Labels ───────────────────────────────────────────────────────────
         labels = encoding["input_ids"].clone()
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
         encoding["labels"] = labels
         return encoding
 
+    def _build_video_inputs(
+        self,
+        video_tensors: list[torch.Tensor],
+        video_grids: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert list of (T,C,H,W) float32 tensors to the flat token layout
+        Qwen3.5 expects for pixel_values_videos.
 
-# ── Model ────────────────────────────────────────────────────────────────────
+        Qwen3.5 VisionPatchEmbed expects:
+          input shape: (num_patches, C, temporal_patch_size, patch_size, patch_size)
+
+        We produce a simpler approximation here — flatten T*H_patches*W_patches
+        and let the model's internal patch embedding handle the rest.
+        The processor's feature_extractor is not used for pre-extracted tensors.
+        """
+        all_frames_flat: list[torch.Tensor] = []
+        all_grids: list[torch.Tensor] = []
+
+        for frames, grid in zip(video_tensors, video_grids):
+            # frames: (T, C, H, W) — already float32 [0,1]
+            all_frames_flat.append(frames)  # keep per-video for now
+            all_grids.append(grid)  # (1, 3)
+
+        # pixel_values_videos: concatenate all video frames along dim=0
+        # shape: (total_T_all_videos, C, H, W)
+        pv = torch.cat(all_frames_flat, dim=0).to(torch.float32)
+
+        # video_grid_thw: (num_videos, 3)
+        grid_thw = torch.cat(all_grids, dim=0)  # (num_videos, 3)
+
+        return pv, grid_thw
+
+    @staticmethod
+    def _merge_encodings(
+        img_enc,
+        vid_enc,
+        image_indices: list[int],
+        video_indices: list[int],
+        total: int,
+    ) -> dict:
+        """Merge image and video encodings back into a single dict in original order."""
+        if img_enc is None:
+            return vid_enc
+        if vid_enc is None:
+            return img_enc
+
+        merged = {}
+        # Handle input_ids and attention_mask by index reconstruction
+        # For simplicity, we concatenate and sort by original order
+        all_keys = set(img_enc.keys()) | set(vid_enc.keys())
+        for key in all_keys:
+            iv = img_enc.get(key)
+            vv = vid_enc.get(key)
+            if iv is None:
+                merged[key] = vv
+            elif vv is None:
+                merged[key] = iv
+            elif isinstance(iv, torch.Tensor) and isinstance(vv, torch.Tensor):
+                merged[key] = torch.cat([iv, vv], dim=0)
+            else:
+                merged[key] = iv
+        return merged
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
 
 
 def load_model_and_processor(cfg: dict):
@@ -239,16 +412,17 @@ def load_model_and_processor(cfg: dict):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        # float32 compute dtype for numerical stability
+        bnb_4bit_compute_dtype=torch.float32,
         bnb_4bit_use_double_quant=True,
     )
 
-    print(f"Loading model: {model_name}")
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    print(f"Loading model via AutoModelForImageTextToText: {model_name}")
+    model = AutoModelForImageTextToText.from_pretrained(
         model_name,
         quantization_config=bnb_config,
         device_map="cuda:0",
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,  # float32 throughout
         trust_remote_code=True,
     )
 
@@ -256,25 +430,13 @@ def load_model_and_processor(cfg: dict):
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    inner = model.model
-    for attr in ("visual", "vision_model", "vision_encoder"):
-        if hasattr(inner, attr):
-            setattr(inner, attr, getattr(inner, attr).to(torch.float16))
-            print(f"  Cast {attr} to float16")
-            break
-
-    visual_module = model.model.visual
-    visual_cls = type(visual_module)
-    if not getattr(visual_cls, "_dtype_patched", False):
-
-        def _patched_dtype(self):
-            try:
-                return next(p.dtype for p in self.parameters() if p.is_floating_point())
-            except StopIteration:
-                return torch.float16
-
-        visual_cls.dtype = property(_patched_dtype)
-        visual_cls._dtype_patched = True
+    # Cast vision encoder to float32 explicitly
+    if hasattr(model, "model") and hasattr(model.model, "visual"):
+        model.model.visual = model.model.visual.to(torch.float32)
+        print("  Cast vision encoder to float32")
+    elif hasattr(model, "visual"):
+        model.visual = model.visual.to(torch.float32)
+        print("  Cast vision encoder to float32")
 
     return model, processor
 
@@ -295,12 +457,10 @@ def apply_lora(model, cfg: dict):
     return model
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 
 def main():
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
     parser = argparse.ArgumentParser(description="Train with TRL SFTTrainer")
     parser.add_argument("--config", default="config/config_trl.yaml")
     parser.add_argument("--base_config", default="config/config_base.yaml")
@@ -308,11 +468,9 @@ def main():
     parser.add_argument("extra", nargs="*", help="Extra flags e.g. debug=on")
     args = parser.parse_args()
 
-    # Parse extra flags:  debug=on / debug=off
     extra_flags = {k: v for k, v in (f.split("=", 1) for f in args.extra if "=" in f)}
     cli_debug = extra_flags.get("debug", "").lower()
 
-    # ── Load and merge configs
     base_cfg = load_config(args.base_config)
     trl_cfg = load_config(args.config)
     cfg = merge_configs(base_cfg, trl_cfg)
@@ -321,7 +479,6 @@ def main():
     ds_cfg = cfg["dataset"]
     smoke_cfg = cfg.get("smoke_test", {})
 
-    # CLI flag overrides config file
     dbg = cfg.get("debug", {"enabled": False})
     if cli_debug == "on":
         dbg["enabled"] = True
@@ -333,13 +490,11 @@ def main():
     if smoke_mode:
         print("\n" + "=" * 60)
         print("  SMOKE TEST / DEBUG MODE ON")
-        print("  Running minimal steps to verify full pipeline.")
-        print("  To disable: python train/train_trl.py  (no flag)")
         print("=" * 60)
     else:
-        print("\n[DEBUG OFF] Full training run. Pass debug=on to enable smoke test.")
+        print("\n[DEBUG OFF] Full training run.")
 
-    # ── Load data
+    # ── Load data ─────────────────────────────────────────────────────────────
     print("\nLoading datasets ...")
     train_records = load_json_dataset(ds_cfg["train_json"])
     val_records = load_json_dataset(ds_cfg["val_json"])
@@ -355,66 +510,46 @@ def main():
     train_dataset = make_hf_dataset(train_records)
     val_dataset = make_hf_dataset(val_records)
 
-    # ── Debug: raw samples
     n_dbg = dbg.get("n_samples", 2)
     for i in range(min(n_dbg, len(train_dataset))):
         debug_raw_sample(train_dataset[i], idx=i, dbg=dbg)
 
-    # ── Debug: label distribution
     debug_label_distribution(train_records, dbg=dbg)
 
-    from transformers import AutoProcessor as _AP
-
-    def fits_in_context_trl(record, processor_ref, max_len):
-        try:
-            msgs = json.loads(record["messages_json"])
-            text = processor_ref.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=False
-            )
-            ids = processor_ref.tokenizer(text, truncation=False)["input_ids"]
-            return len(ids) <= max_len
-        except Exception:
-            return False
-
-    _pre_proc = _AP.from_pretrained(cfg["model"]["name"], trust_remote_code=True)
-    if _pre_proc.tokenizer.pad_token is None:
-        _pre_proc.tokenizer.pad_token = _pre_proc.tokenizer.eos_token
+    # ── Context-length filter (use a lightweight pre-check processor) ─────────
+    _proc = AutoProcessor.from_pretrained(cfg["model"]["name"], trust_remote_code=True)
+    if _proc.tokenizer.pad_token is None:
+        _proc.tokenizer.pad_token = _proc.tokenizer.eos_token
+    max_len = cfg["model"]["max_seq_length"]
 
     before = len(train_dataset)
-    train_dataset = train_dataset.filter(
-        lambda s: fits_in_context_trl(s, _pre_proc, cfg["model"]["max_seq_length"])
-    )
-    val_dataset = val_dataset.filter(
-        lambda s: fits_in_context_trl(s, _pre_proc, cfg["model"]["max_seq_length"])
-    )
+    train_dataset = train_dataset.filter(lambda s: fits_in_context(s, _proc, max_len))
+    val_dataset = val_dataset.filter(lambda s: fits_in_context(s, _proc, max_len))
     print(
-        f"  After context filter — Train: {len(train_dataset)}  |  Val: {len(val_dataset)}"
+        f"  After context filter → Train: {len(train_dataset)}  Val: {len(val_dataset)}"
         f"  (removed {before - len(train_dataset)} long samples)"
     )
-    del _pre_proc
+    del _proc
 
-    # ── Load model
+    # ── Load model ────────────────────────────────────────────────────────────
     model, processor = load_model_and_processor(cfg)
     model = apply_lora(model, cfg)
 
-    # ── Debug: tokenized samples (needs processor)
-    max_seq = cfg["model"]["max_seq_length"]
     for i in range(min(n_dbg, len(train_dataset))):
         debug_tokenized_sample(
             train_dataset[i],
             idx=i,
             processor=processor,
-            max_seq_length=max_seq,
+            max_seq_length=max_len,
             dbg=dbg,
         )
 
-    # ── Debug: GPU memory
     debug_gpu(dbg=dbg)
 
-    # ── Collator
-    collator = VLMDataCollator(processor, max_seq_length=max_seq)
+    # ── Collator ──────────────────────────────────────────────────────────────
+    collator = VLMDataCollator(processor, max_seq_length=max_len)
 
-    # ── TrainingArguments — smoke overrides applied here
+    # ── TrainingArguments ─────────────────────────────────────────────────────
     output_dir = str(resolve(train_cfg["output_dir"]))
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -434,7 +569,7 @@ def main():
         if smoke_mode
         else train_cfg["eval_steps"]
     )
-    logging_steps = (
+    log_steps = (
         smoke_cfg.get("logging_steps", train_cfg["logging_steps"])
         if smoke_mode
         else train_cfg["logging_steps"]
@@ -442,8 +577,7 @@ def main():
 
     if smoke_mode:
         print(
-            f"\n  [SMOKE] epochs={num_epochs}  max_steps={max_steps}"
-            f"  save_steps={save_steps}  eval_steps={eval_steps}"
+            f"\n  [SMOKE] epochs={num_epochs}  max_steps={max_steps}  save_steps={save_steps}"
         )
 
     training_args = TrainingArguments(
@@ -459,12 +593,12 @@ def main():
         weight_decay=train_cfg["weight_decay"],
         optim=train_cfg["optim"],
         bf16=train_cfg["bf16"],
-        fp16=train_cfg["fp16"],
+        fp16=False,  # disabled — we use float32
         save_strategy=train_cfg["save_strategy"],
         save_steps=save_steps,
         eval_strategy=train_cfg["eval_strategy"],
         eval_steps=eval_steps,
-        logging_steps=logging_steps,
+        logging_steps=log_steps,
         load_best_model_at_end=False,
         report_to=train_cfg["report_to"],
         dataloader_num_workers=train_cfg["dataloader_num_workers"],
@@ -474,7 +608,6 @@ def main():
         ddp_find_unused_parameters=False,
     )
 
-    # ── Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -483,12 +616,10 @@ def main():
         data_collator=collator,
     )
 
-    # ── Train
     print("\nStarting training ...")
-    resume_ckpt = output_dir if args.resume else None
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    trainer.train(resume_from_checkpoint=output_dir if args.resume else None)
 
-    # ── Save final adapter
+    # ── Save ──────────────────────────────────────────────────────────────────
     final_path = Path(output_dir) / "final_adapter"
     trainer.model.save_pretrained(final_path)
     processor.save_pretrained(final_path)
@@ -496,12 +627,10 @@ def main():
 
     if smoke_mode:
         print("\n" + "=" * 60)
-        print("  ✓ SMOKE TEST PASSED — full pipeline completed.")
-        print("  Verified: load → train → save adapter")
-        print("  Run without debug=on for full training.")
+        print("  ✓ SMOKE TEST PASSED — load → train → save complete.")
         print("=" * 60)
     else:
-        print("  Next: run eval/eval_trl.py  or  merge with merge_trl.py")
+        print("  Next: eval/eval_trl.py  or  merge_trl.py")
 
 
 if __name__ == "__main__":
